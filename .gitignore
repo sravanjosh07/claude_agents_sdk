@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.DS_Store
+.env
+runs/
+src/__pycache__/
+.claude/*.sqlite3
+.claude/*.jsonl
+.claude/settings.local.json

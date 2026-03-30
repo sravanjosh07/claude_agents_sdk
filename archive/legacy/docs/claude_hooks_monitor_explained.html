@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>claude_hooks_monitor.py Explained</title>
+</head>
+<body>
+  <h1><code>claude_hooks_monitor.py</code> Explained</h1>
+
+  <p>Source file:</p>
+  <ul>
+    <li><code>/Users/sravanjosh/Documents/Aiceberg/cluade_sdk/src/claude_hooks_monitor.py</code></li>
+  </ul>
+
+  <p>This page is focused on one question:</p>
+  <ul>
+    <li>what exactly is happening inside <code>claude_hooks_monitor.py</code></li>
+  </ul>
+
+  <p>It is intentionally plain-English and basic HTML so it can be copied into Confluence easily.</p>
+
+  <h2>The Shortest Mental Model</h2>
+
+  <p>A hook in this file means:</p>
+  <ul>
+    <li>Claude reaches a named event in the agent loop</li>
+    <li>the SDK looks up which Python callback function was registered for that event</li>
+    <li>the SDK calls that function</li>
+    <li>the function returns a small JSON-shaped decision object</li>
+  </ul>
+
+  <p>So the main pattern is:</p>
+  <ul>
+    <li>define callback functions</li>
+    <li>group them into a hook registry</li>
+    <li>pass that registry to <code>ClaudeAgentOptions</code></li>
+    <li>call <code>query(...)</code></li>
+    <li>let the SDK invoke your callbacks later when events happen</li>
+  </ul>
+
+  <h2>Flowchart 1: Registration Time</h2>
+
+  <p>This is what happens before Claude starts answering.</p>
+
+  <pre>Python module loads
+    |
+    v
+Plain async functions exist
+    - on_user_prompt_submit
+    - on_pre_tool_use
+    - on_post_tool_use
+    - ...
+    |
+    v
+build_hooks()
+    |
+    v
+Return dict:
+hook event name -&gt; list of HookMatcher objects
+    |
+    v
+ClaudeAgentOptions(hooks=build_hooks(), ...)
+    |
+    v
+query(prompt, options)
+    |
+    v
+Claude SDK runtime stores the hook registry</pre>
+
+  <h2>Flowchart 2: Runtime Event Flow</h2>
+
+  <p>This is what happens after <code>query(...)</code> starts the run.</p>
+
+  <pre>User prompt passed to query(...)
+    |
+    v
+Claude SDK starts agent loop
+    |
+    v
+Fire UserPromptSubmit event
+    |
+    v
+SDK calls on_user_prompt_submit(input_data, tool_use_id, context)
+    |
+    v
+Did callback return a block decision?
+    | yes                         | no
+    v                             v
+Stop early and surface      Claude continues the run
+the block reason                 |
+                                 v
+                         Does Claude need a tool?
+                            | no          | yes
+                            v             v
+                     Claude writes   Fire PreToolUse event
+                     answer text          |
+                                          v
+                                  SDK calls on_pre_tool_use(...)
+                                          |
+                                          v
+                                     Tool executes
+                                          |
+                                          v
+                                Did tool succeed?
+                                  | yes       | no
+                                  v           v
+                         Fire PostToolUse   Fire PostToolUseFailure
+                               event                event
+                                  \                 /
+                                   \               /
+                                    v             v
+                                  Claude continues reasoning
+                                          |
+                                          v
+                              Did Claude spawn a subagent?
+                                 | yes             | no
+                                 v                 v
+                         Fire SubagentStart   Continue normal run
+                         and later SubagentStop      |
+                                 \                  /
+                                  \                /
+                                   v              v
+                                      Fire Stop event
+                                            |
+                                            v
+                                    ResultMessage produced</pre>
+
+  <h2>Flowchart 3: Exact Registration Shape In This File</h2>
+
+  <p>This is the most important configuration object in the file.</p>
+
+  <pre>build_hooks()
+  |
+  +-- UserPromptSubmit   -&gt; [HookMatcher(hooks=[on_user_prompt_submit])]
+  +-- PreToolUse         -&gt; [HookMatcher(hooks=[on_pre_tool_use])]
+  +-- PostToolUse        -&gt; [HookMatcher(hooks=[on_post_tool_use])]
+  +-- PostToolUseFailure -&gt; [HookMatcher(hooks=[on_post_tool_use_failure])]
+  +-- Stop               -&gt; [HookMatcher(hooks=[on_stop])]
+  +-- SubagentStart      -&gt; [HookMatcher(hooks=[on_subagent_start])]
+  +-- SubagentStop       -&gt; [HookMatcher(hooks=[on_subagent_stop])]
+  +-- PreCompact         -&gt; [HookMatcher(hooks=[on_pre_compact])]
+  +-- Notification       -&gt; [HookMatcher(hooks=[on_notification])]
+  +-- PermissionRequest  -&gt; [HookMatcher(hooks=[on_permission_request])]</pre>
+
+  <h2>What "Callback Function" Means Here</h2>
+
+  <p>A callback is just:</p>
+  <ul>
+    <li>a function you hand to the SDK now</li>
+    <li>so the SDK can call it later</li>
+  </ul>
+
+  <p>That is why this works:</p>
+
+  <pre><code>HookMatcher(hooks=[on_pre_tool_use])</code></pre>
+
+  <p>You are passing the function itself, not calling it yet.</p>
+
+  <p>This would be wrong:</p>
+
+  <pre><code>HookMatcher(hooks=[on_pre_tool_use()])</code></pre>
+
+  <p>That would run the function immediately during setup instead of registering it for later.</p>
+
+  <h2>What the "Loose Functions" Are</h2>
+
+  <p>These are plain top-level functions in the file. They are not methods on a class. That is normal Python.</p>
+
+  <p>In this file, they fall into three groups.</p>
+
+  <h3>1. Hook Callback Functions</h3>
+
+  <p>These are the functions Claude may call during the run:</p>
+  <ul>
+    <li><code>on_user_prompt_submit</code></li>
+    <li><code>on_pre_tool_use</code></li>
+    <li><code>on_post_tool_use</code></li>
+    <li><code>on_post_tool_use_failure</code></li>
+    <li><code>on_stop</code></li>
+    <li><code>on_subagent_start</code></li>
+    <li><code>on_subagent_stop</code></li>
+    <li><code>on_pre_compact</code></li>
+    <li><code>on_notification</code></li>
+    <li><code>on_permission_request</code></li>
+  </ul>
+
+  <h3>2. Shared Helper Functions</h3>
+
+  <p>These are not registered as hooks. They support the callbacks:</p>
+  <ul>
+    <li><code>json_safe</code></li>
+    <li><code>initialize_run_dir</code></li>
+    <li><code>write_summary</code></li>
+    <li><code>append_jsonl</code></li>
+    <li><code>log_hook</code></li>
+    <li><code>log_message</code></li>
+    <li><code>find_blocked_word</code></li>
+    <li><code>print_message</code></li>
+  </ul>
+
+  <h3>3. Orchestration Functions</h3>
+
+  <p>These wire the whole run together:</p>
+  <ul>
+    <li><code>build_hooks</code></li>
+    <li><code>run_prompt</code></li>
+    <li><code>main</code></li>
+  </ul>
+
+  <h2>Why <code>HookMatcher</code> Exists</h2>
+
+  <p><code>HookMatcher</code> is not the hook event itself.</p>
+
+  <p>It is a small SDK configuration object that says:</p>
+  <ul>
+    <li>which callback functions belong under this event</li>
+    <li>whether there is an optional matcher filter</li>
+    <li>whether there is an optional timeout</li>
+  </ul>
+
+  <p>In this file, every registration looks like:</p>
+
+  <pre><code>"PreToolUse": [HookMatcher(hooks=[on_pre_tool_use])]</code></pre>
+
+  <p>That means:</p>
+  <ul>
+    <li>hook event bucket = <code>PreToolUse</code></li>
+    <li>matcher filter = none</li>
+    <li>callbacks to run = <code>on_pre_tool_use</code></li>
+  </ul>
+
+  <p>Because no <code>matcher=</code> is given here, this file is saying:</p>
+  <ul>
+    <li>run the callback for every event in that bucket</li>
+  </ul>
+
+  <p>Example:</p>
+  <ul>
+    <li>every <code>PreToolUse</code> event calls <code>on_pre_tool_use</code></li>
+    <li>every <code>Stop</code> event calls <code>on_stop</code></li>
+  </ul>
+
+  <p>If you wanted to only watch Bash tool calls, the shape would be more like:</p>
+
+  <pre><code>"PreToolUse": [HookMatcher(matcher="Bash", hooks=[on_pre_tool_use])]</code></pre>
+
+  <p>Then the callback would run only when the tool name matched <code>Bash</code>.</p>
+
+  <h2>Why We Are Not "Registering to HookMatcher"</h2>
+
+  <p>The more accurate wording is:</p>
+  <ul>
+    <li>we create <code>HookMatcher</code> objects</li>
+    <li>then we register the whole hook map in <code>ClaudeAgentOptions(hooks=...)</code></li>
+  </ul>
+
+  <p>So <code>HookMatcher</code> is one piece inside the registration map.</p>
+
+  <p>The actual registration happens when <code>build_hooks()</code> is passed into:</p>
+
+  <pre><code>options = ClaudeAgentOptions(
+    hooks=build_hooks(),
+    ...
+)</code></pre>
+
+  <h2>How the SDK Knows Which Callback to Call</h2>
+
+  <p>At a high level, it knows from two things:</p>
+  <ul>
+    <li>the hook event name, such as <code>UserPromptSubmit</code></li>
+    <li>the callback list stored inside the <code>HookMatcher</code></li>
+  </ul>
+
+  <p>So the runtime logic is roughly:</p>
+  <ol>
+    <li>an event fires</li>
+    <li>the SDK looks up that event name in the <code>hooks</code> dictionary</li>
+    <li>it checks the matchers under that event</li>
+    <li>it runs the callback functions for the matchers that apply</li>
+  </ol>
+
+  <p>In this file, because every matcher is very broad, each event bucket has one obvious callback.</p>
+
+  <p>Example:</p>
+  <ul>
+    <li>event name <code>PostToolUse</code></li>
+    <li>SDK finds <code>hooks["PostToolUse"]</code></li>
+    <li>that list contains <code>HookMatcher(hooks=[on_post_tool_use])</code></li>
+    <li>so the SDK calls <code>on_post_tool_use(...)</code></li>
+  </ul>
+
+  <h2>Why the Function Is Named <code>build_hooks()</code></h2>
+
+  <p><code>build_hooks()</code> is a good name because it builds and returns the hook registry.</p>
+
+  <p>It does not itself handle any runtime event.</p>
+
+  <p>That is why a name like <code>simplehookhandler()</code> would be misleading:</p>
+  <ul>
+    <li><code>handler</code> sounds like a function that runs when an event fires</li>
+    <li>but <code>build_hooks()</code> runs once during setup and returns configuration</li>
+  </ul>
+
+  <p>So the naming split in this file is actually clean:</p>
+  <ul>
+    <li><code>on_pre_tool_use</code> is a runtime handler</li>
+    <li><code>build_hooks</code> is a setup helper</li>
+  </ul>
+
+  <h2>What Each Callback Receives</h2>
+
+  <p>Each hook callback in this file has the same signature:</p>
+
+  <pre><code>async def some_hook(
+    input_data: dict[str, Any], tool_use_id: str | None, context: HookContext
+) -&gt; HookJSONOutput:</code></pre>
+
+  <p>Very plain-English meaning:</p>
+  <ul>
+    <li><code>input_data</code>: the payload for this event</li>
+    <li><code>tool_use_id</code>: a correlation ID for tool-related events, or <code>None</code></li>
+    <li><code>context</code>: extra hook context from the SDK</li>
+  </ul>
+
+  <p>In this file, many callbacks do:</p>
+
+  <pre><code>del context</code></pre>
+
+  <p>That just means:</p>
+  <ul>
+    <li>the function received <code>context</code></li>
+    <li>this example does not need it</li>
+    <li>deleting it avoids an unused-variable warning and makes the example feel intentional</li>
+  </ul>
+
+  <h2>What Each Callback Returns</h2>
+
+  <p>Most callbacks in this file return:</p>
+
+  <pre><code>{}</code></pre>
+
+  <p>That means:</p>
+  <ul>
+    <li>observe and log the event</li>
+    <li>do not modify or block anything</li>
+  </ul>
+
+  <p>Only <code>on_user_prompt_submit(...)</code> sometimes returns a block result:</p>
+
+  <pre><code>{
+    "decision": "block",
+    "reason": reason,
+    "systemMessage": reason,
+}</code></pre>
+
+  <p>That means:</p>
+  <ul>
+    <li>stop the run early</li>
+    <li>record why</li>
+    <li>surface the reason back into the runtime</li>
+  </ul>
+
+  <h2>The Simplest Way to Read the File Top to Bottom</h2>
+
+  <h3>Section A: Setup and Logging Helpers</h3>
+
+  <p>The first part of the file creates a run directory and JSONL logs:</p>
+  <ul>
+    <li><code>initialize_run_dir</code></li>
+    <li><code>write_summary</code></li>
+    <li><code>append_jsonl</code></li>
+    <li><code>log_hook</code></li>
+    <li><code>log_message</code></li>
+  </ul>
+
+  <p>These functions are not part of Claude's hook API. They are your own local observability layer.</p>
+
+  <h3>Section B: One Small Local Rule</h3>
+
+  <p><code>find_blocked_word</code> looks for:</p>
+  <ul>
+    <li><code>hurt</code></li>
+    <li><code>hunt</code></li>
+    <li><code>harm</code></li>
+  </ul>
+
+  <p>This is only used by <code>on_user_prompt_submit</code>.</p>
+
+  <h3>Section C: Hook Callbacks</h3>
+
+  <p>Each <code>on_*</code> function is one callback that Claude may invoke.</p>
+
+  <p>Most of them do exactly two things:</p>
+  <ul>
+    <li>call <code>log_hook(...)</code></li>
+    <li>return <code>{}</code></li>
+  </ul>
+
+  <p>That makes this file a very good learning example, because the hook behavior is mostly transparent logging.</p>
+
+  <h3>Section D: Hook Registration</h3>
+
+  <p><code>build_hooks()</code> is the bridge from plain Python functions to Claude's runtime hook system.</p>
+
+  <p>Without <code>build_hooks()</code>, the callback functions would just be ordinary Python functions sitting in the file unused.</p>
+
+  <h3>Section E: Runtime Launch</h3>
+
+  <p><code>run_prompt()</code> does the key setup:</p>
+  <ul>
+    <li>creates the run directory</li>
+    <li>builds <code>ClaudeAgentOptions</code></li>
+    <li>passes <code>hooks=build_hooks()</code></li>
+    <li>starts <code>query(prompt=prompt, options=options)</code></li>
+    <li>logs streamed SDK messages</li>
+  </ul>
+
+  <p>This is where your local code hands control to the Claude SDK.</p>
+
+  <h2>Two Good Prompts for Exploring This File</h2>
+
+  <p>These match the runbook in <code>claude_hooks_monitor.md</code>.</p>
+
+  <h3>Prompt 1: No Tools</h3>
+
+  <pre>Hi Claude. Please reply in one short friendly sentence about what hooks are. Do not read files, search the repo, or use any tools.</pre>
+
+  <p>Best for learning:</p>
+  <ul>
+    <li><code>UserPromptSubmit</code></li>
+    <li><code>Stop</code></li>
+  </ul>
+
+  <p>This gives you the clean baseline.</p>
+
+  <h3>Prompt 2: With Tools</h3>
+
+  <pre>Please use the Read and Glob tools to inspect this workspace. Find the hook registration in claude_hooks_monitor.py and tell me which hook names are registered.</pre>
+
+  <p>Best for learning:</p>
+  <ul>
+    <li><code>PreToolUse</code></li>
+    <li><code>PostToolUse</code></li>
+    <li><code>tool_use_id</code></li>
+    <li>tool payload structure in <code>input_data</code></li>
+  </ul>
+
+  <p>This gives you the tool lifecycle.</p>
+
+  <h2>What to Look for in the Logs</h2>
+
+  <p>After each run, open:</p>
+  <ul>
+    <li><code>runs/entire_log_run_&lt;timestamp&gt;/hook_events.jsonl</code></li>
+    <li><code>runs/entire_log_run_&lt;timestamp&gt;/sdk_messages.jsonl</code></li>
+    <li><code>runs/entire_log_run_&lt;timestamp&gt;/summary.json</code></li>
+  </ul>
+
+  <p>Useful comparisons:</p>
+  <ul>
+    <li>which hook names appeared</li>
+    <li>how many times each hook appeared</li>
+    <li>whether <code>tool_use_id</code> is empty or populated</li>
+    <li>what fields exist in <code>input_data</code> for prompt hooks versus tool hooks</li>
+    <li>how the SDK message stream is richer than the hook log</li>
+  </ul>
+
+  <h2>Source-Backed Points Versus Local Inference</h2>
+
+  <p>The following are directly supported by Anthropic's current docs:</p>
+  <ul>
+    <li>hooks are callback functions that run in response to agent events</li>
+    <li><code>ClaudeAgentOptions(hooks=...)</code> is how Python registers hooks</li>
+    <li><code>HookMatcher</code> has <code>matcher</code>, <code>hooks</code>, and <code>timeout</code></li>
+    <li>Python supports <code>PreToolUse</code>, <code>PostToolUse</code>, <code>PostToolUseFailure</code>, <code>UserPromptSubmit</code>, <code>Stop</code>, <code>SubagentStart</code>, <code>SubagentStop</code>, <code>PreCompact</code>, <code>Notification</code>, and <code>PermissionRequest</code></li>
+    <li>every hook callback receives <code>input_data</code>, <code>tool_use_id</code>, and <code>context</code></li>
+  </ul>
+
+  <p>The following are local conclusions from reading this file together with those docs:</p>
+  <ul>
+    <li><code>build_hooks()</code> is named well because it builds configuration rather than handling runtime events</li>
+    <li>the file uses broad matchers because no <code>matcher=</code> field is provided</li>
+    <li>most callbacks are intentionally no-op observers because they return <code>{}</code></li>
+    <li>this file is designed more as a hook explorer than as a policy engine</li>
+  </ul>
+
+  <h2>Sources</h2>
+
+  <p>Verified on March 25, 2026:</p>
+  <ul>
+    <li><a href="https://platform.claude.com/docs/en/agent-sdk/hooks">Anthropic hooks guide</a></li>
+    <li><a href="https://platform.claude.com/docs/en/agent-sdk/python">Anthropic Python SDK reference</a></li>
+    <li><a href="https://platform.claude.com/docs/en/agent-sdk/agent-loop">Anthropic agent loop guide</a></li>
+    <li><a href="https://github.com/anthropics/claude-agent-sdk-python">Anthropic Python SDK repository</a></li>
+  </ul>
+</body>
+</html>

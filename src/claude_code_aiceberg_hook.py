@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Project-local Claude Code hook entrypoint for Aiceberg monitoring.
+Claude Code CLI hook handler.
 
-This file keeps the Claude Code path readable in one place:
-- parse hook input
-- keep the tiny SQLite state needed across hook processes
-- map one Claude conversation thread to one active Aiceberg turn session
-- open/close Aiceberg prompt and tool events
+Claude Code runs this as a separate process for each hook event.
+Input arrives as JSON on stdin; output goes to stdout.
+State is persisted in SQLite so it survives across process invocations.
 """
 
 from __future__ import annotations
@@ -17,772 +15,501 @@ import json
 import os
 import sqlite3
 import sys
-import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from claude_aiceberg.hooks import build_block_output
-from claude_aiceberg.sender import AicebergSender, OpenAicebergEvent
+from claude_aiceberg.config import (
+    AICEBERG_HOOK_DEBUG_ENV,
+    env_flag,
+    workspace_paths,
+)
+from claude_aiceberg.sender import (
+    AicebergResponse,
+    AicebergSender,
+    OpenAicebergEvent,
+    serialize_content,
+)
 from claude_aiceberg.workflow import (
-    DEFAULT_BLOCK_CLOSE_MESSAGE,
+    BLOCK_MESSAGE,
     INCOMPLETE_TOOL_MESSAGE,
     USER_EVENT_TYPE,
-    build_hook_metadata,
-    build_tool_payload,
     classify_tool_event,
 )
 
+# ── Debug log ────────────────────────────────────────────────────────────────
 
-STATE_DB_PATH = Path(__file__).resolve().parents[1] / ".claude" / "aiceberg_state.sqlite3"
-HOOK_DEBUG_LOG_PATH = Path(__file__).resolve().parents[1] / ".claude" / "aiceberg_hook_debug.jsonl"
+_debug_log_path: Path | None = None
+_debug_enabled: bool = False
 
+
+def init_debug(workspace: str | None = None) -> None:
+    global _debug_log_path, _debug_enabled
+    paths = workspace_paths(workspace)
+    _debug_log_path = paths.debug_log_path
+    _debug_enabled = env_flag(AICEBERG_HOOK_DEBUG_ENV, False)
+
+
+def debug(hook: str, phase: str, **extra: Any) -> None:
+    """Append one JSONL line to the debug log."""
+    if not _debug_enabled or not _debug_log_path:
+        return
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "hook": hook,
+        "phase": phase,
+        **{k: v for k, v in extra.items() if v is not None},
+    }
+    try:
+        _debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(_debug_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+# ── SQLite state store ───────────────────────────────────────────────────────
 
 class ClaudeCodeStateStore:
-    """Tiny SQLite store for the active turn and any open Aiceberg events."""
+    """Cross-process state for open Aiceberg events, turns, and subagents."""
 
-    def __init__(self, path: Path = STATE_DB_PATH) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS open_events (
+            key TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            input_text TEXT NOT NULL,
+            metadata TEXT NOT NULL,
+            label TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS current_turns (
+            session_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            started_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subagents (
+            agent_id TEXT PRIMARY KEY,
+            agent_type TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL,
+            stopped_at TEXT,
+            transcript_path TEXT
+        );
+    """
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+    def __init__(self, db_path: str | Path) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(db_path), timeout=5)
+        self.conn.executescript(self._SCHEMA)
 
-    @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+    def close(self) -> None:
+        self.conn.close()
 
-    def _init_schema(self) -> None:
-        with self._connection() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS open_events (
-                    scope TEXT NOT NULL,
-                    event_key TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    input_text TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    label TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS current_turns (
-                    thread_id TEXT PRIMARY KEY,
-                    turn_session_id TEXT NOT NULL
-                )
-                """
-            )
+    # ── open_events ──
 
-    def save_event(self, scope: str, event_key: str, event: OpenAicebergEvent) -> None:
-        with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO open_events(
-                    scope, event_key, session_id, event_id, event_type, input_text, metadata_json, label
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scope,
-                    event_key,
-                    event.session_id,
-                    event.event_id,
-                    event.event_type,
-                    event.input_text,
-                    json.dumps(event.metadata, sort_keys=True),
-                    event.label,
-                ),
-            )
+    def store_event(self, key: str, event: OpenAicebergEvent) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO open_events VALUES (?,?,?,?,?,?,?)",
+            (key, event.event_id, event.event_type, event.session_id,
+             event.input_text, json.dumps(event.metadata), event.label),
+        )
+        self.conn.commit()
 
-    def get_event(self, scope: str, event_key: str) -> OpenAicebergEvent | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                """
-                SELECT event_id, event_type, session_id, input_text, metadata_json, label
-                FROM open_events
-                WHERE scope = ? AND event_key = ?
-                """,
-                (scope, event_key),
-            ).fetchone()
-        return self._row_to_event(row)
-
-    def delete_event(self, scope: str, event_key: str) -> None:
-        with self._connection() as conn:
-            conn.execute(
-                "DELETE FROM open_events WHERE scope = ? AND event_key = ?",
-                (scope, event_key),
-            )
-
-    def list_tool_events(self, turn_session_id: str) -> list[tuple[str, OpenAicebergEvent]]:
-        with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT event_key, event_id, event_type, session_id, input_text, metadata_json, label
-                FROM open_events
-                WHERE scope = 'tool' AND session_id = ?
-                """,
-                (turn_session_id,),
-            ).fetchall()
-        events: list[tuple[str, OpenAicebergEvent]] = []
-        for row in rows:
-            event = self._row_to_event(row[1:])
-            if event is not None:
-                events.append((str(row[0]), event))
-        return events
-
-    def find_matching_tool_event(
-        self,
-        turn_session_id: str,
-        tool_name: str,
-        tool_input: Any,
-    ) -> tuple[str, OpenAicebergEvent] | None:
-        target_fingerprint = fingerprint_tool_call(turn_session_id, tool_name, tool_input)
-        for event_key, event in self.list_tool_events(turn_session_id):
-            try:
-                payload = json.loads(event.input_text)
-            except json.JSONDecodeError:
-                continue
-            event_tool_name = str(payload.get("tool_name", "")).strip()
-            event_tool_input = payload.get("tool_input", {}) or {}
-            if event_tool_name != tool_name:
-                continue
-            if fingerprint_tool_call(turn_session_id, event_tool_name, event_tool_input) != target_fingerprint:
-                continue
-            return event_key, event
-        return None
-
-    def get_current_turn(self, thread_id: str) -> str | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT turn_session_id FROM current_turns WHERE thread_id = ?",
-                (thread_id,),
-            ).fetchone()
-        return str(row[0]) if row else None
-
-    def set_current_turn(self, thread_id: str, turn_session_id: str) -> None:
-        with self._connection() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO current_turns(thread_id, turn_session_id) VALUES (?, ?)",
-                (thread_id, turn_session_id),
-            )
-
-    def clear_current_turn(self, thread_id: str) -> None:
-        with self._connection() as conn:
-            conn.execute(
-                "DELETE FROM current_turns WHERE thread_id = ?",
-                (thread_id,),
-            )
-
-    @staticmethod
-    def _row_to_event(row: tuple[Any, ...] | None) -> OpenAicebergEvent | None:
-        if row is None:
+    def load_event(self, key: str) -> OpenAicebergEvent | None:
+        row = self.conn.execute(
+            "SELECT event_id, event_type, session_id, input_text, metadata, label "
+            "FROM open_events WHERE key = ?", (key,),
+        ).fetchone()
+        if not row:
             return None
         return OpenAicebergEvent(
-            event_id=str(row[0]),
-            event_type=str(row[1]),
-            session_id=str(row[2]),
-            input_text=str(row[3]),
-            metadata=json.loads(str(row[4])),
-            label=str(row[5]),
+            event_id=row[0], event_type=row[1], session_id=row[2],
+            input_text=row[3], metadata=json.loads(row[4]), label=row[5],
         )
 
+    def delete_event(self, key: str) -> None:
+        self.conn.execute("DELETE FROM open_events WHERE key = ?", (key,))
+        self.conn.commit()
 
-def hook_debug_enabled() -> bool:
-    return os.getenv("AICEBERG_HOOK_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+    def all_events(self) -> list[tuple[str, OpenAicebergEvent]]:
+        rows = self.conn.execute(
+            "SELECT key, event_id, event_type, session_id, input_text, metadata, label "
+            "FROM open_events",
+        ).fetchall()
+        return [
+            (r[0], OpenAicebergEvent(
+                event_id=r[1], event_type=r[2], session_id=r[3],
+                input_text=r[4], metadata=json.loads(r[5]), label=r[6]))
+            for r in rows
+        ]
 
+    # ── current_turns ──
 
-def append_hook_debug(
-    hook_name: str,
-    input_data: dict[str, Any],
-    *,
-    note: str,
-    session_id: str = "",
-    turn_session_id: str = "",
-    tool_name: str = "",
-    tool_use_id: str = "",
-    raw_tool_use_id: str = "",
-) -> None:
-    if not hook_debug_enabled():
-        return
+    def store_turn(self, session_id: str, event_id: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO current_turns VALUES (?,?,?)",
+            (session_id, event_id, datetime.now(timezone.utc).isoformat()),
+        )
+        self.conn.commit()
 
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "hook_name": hook_name,
-        "note": note,
-        "session_id": session_id,
-        "turn_session_id": turn_session_id,
-        "tool_name": tool_name,
-        "tool_use_id": tool_use_id,
-        "raw_tool_use_id": raw_tool_use_id,
-        "keys": sorted(str(key) for key in input_data.keys()),
-    }
-    HOOK_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with HOOK_DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n")
+    def load_turn_event_id(self, session_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT event_id FROM current_turns WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row[0] if row else None
 
+    def delete_turn(self, session_id: str) -> None:
+        self.conn.execute(
+            "DELETE FROM current_turns WHERE session_id = ?", (session_id,),
+        )
+        self.conn.commit()
 
-def extract_last_assistant_text(transcript_path: str) -> str:
-    path = Path(transcript_path).expanduser()
-    if not path.is_file():
-        return ""
+    # ── subagents ──
 
-    last_text = ""
-    try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                entry = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("type") != "assistant":
-                continue
-            content = entry.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                        last_text = str(block["text"])
-                        break
-            elif isinstance(content, str) and content:
-                last_text = content
-    except OSError:
-        return ""
-    return last_text
+    def store_subagent(
+        self, agent_id: str, agent_type: str, parent_session_id: str,
+    ) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO subagents VALUES (?,?,?,?,?,?)",
+            (agent_id, agent_type, parent_session_id,
+             datetime.now(timezone.utc).isoformat(), None, None),
+        )
+        self.conn.commit()
+
+    def stop_subagent(
+        self, agent_id: str, transcript_path: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE subagents SET stopped_at = ?, transcript_path = ? "
+            "WHERE agent_id = ?",
+            (datetime.now(timezone.utc).isoformat(), transcript_path, agent_id),
+        )
+        self.conn.commit()
 
 
-def first_non_empty_text(*values: Any) -> str:
-    for value in values:
-        text = str(value or "").strip()
-        if text:
-            return text
+# ── Extraction helpers ───────────────────────────────────────────────────────
+
+def _get(data: dict[str, Any], *keys: str) -> str:
+    """Try multiple key names, return first non-empty string."""
+    for k in keys:
+        val = str(data.get(k, "")).strip()
+        if val:
+            return val
     return ""
 
 
-def extract_tool_name(input_data: dict[str, Any]) -> str:
-    return first_non_empty_text(
-        input_data.get("tool_name"),
-        input_data.get("toolName"),
-        input_data.get("tool"),
-        input_data.get("name"),
-    )
+def _tool_key(data: dict[str, Any]) -> str:
+    """Stable key for matching a tool open event to its close event."""
+    tid = _get(data, "tool_use_id")
+    if tid:
+        return f"tool:{tid}"
+    name = _get(data, "tool_name")
+    raw_input = data.get("tool_input", data.get("input", {}))
+    digest = hashlib.sha256(
+        json.dumps(raw_input, sort_keys=True, ensure_ascii=True).encode()
+    ).hexdigest()[:12]
+    return f"tool:{name}:{digest}"
 
 
-def extract_tool_use_id(input_data: dict[str, Any], tool_use_id: str | None = None) -> str:
-    return first_non_empty_text(
-        tool_use_id,
-        input_data.get("tool_use_id"),
-        input_data.get("toolUseId"),
-        input_data.get("id"),
-    )
+def _metadata(data: dict[str, Any], **extra: str) -> dict[str, Any]:
+    md: dict[str, Any] = {
+        "hook_event_name": _get(data, "hook_event_name"),
+        "user_id": os.getenv("AICEBERG_USER_ID", "claudeagent").strip() or "claudeagent",
+    }
+    for k, v in extra.items():
+        text = str(v).strip()
+        if text:
+            md[k] = text
+    return md
 
 
-def extract_tool_input(input_data: dict[str, Any]) -> Any:
-    for key in ("tool_input", "toolInput", "input"):
-        value = input_data.get(key)
-        if value not in (None, "", []):
-            return value
-    return {}
+def _extract_last_assistant_text(data: dict[str, Any]) -> str:
+    """Pull the assistant's final response from hook data.
+
+    Claude Code passes `last_assistant_message` in the Stop hook payload.
+    """
+    return str(data.get("last_assistant_message", "")).strip()
 
 
-def extract_tool_response(input_data: dict[str, Any]) -> Any:
-    for key in ("tool_response", "toolResponse", "tool_result", "toolResult", "response", "result", "output"):
-        if key in input_data:
-            return input_data.get(key)
-    return None
+# ── Hook handlers ────────────────────────────────────────────────────────────
+
+def _sync(coro):
+    """Run an async coroutine synchronously."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
-def extract_tool_error(input_data: dict[str, Any]) -> str:
-    return first_non_empty_text(
-        input_data.get("error"),
-        input_data.get("message"),
-        input_data.get("reason"),
-    )
+def _block_result(hook: str, response: AicebergResponse) -> dict[str, Any]:
+    reason = response.message or BLOCK_MESSAGE
+    result: dict[str, Any] = {"decision": "block", "reason": reason}
+    if hook in ("PreToolUse", "PermissionRequest"):
+        result["hookSpecificOutput"] = {"suppressToolOutput": True}
+    return result
 
 
-def fingerprint_tool_call(turn_session_id: str, tool_name: str, tool_input: Any) -> str:
-    raw = json.dumps(
-        {
-            "turn_session_id": turn_session_id,
-            "tool_name": tool_name,
-            "tool_input": tool_input,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+def handle_user_prompt_submit(
+    data: dict[str, Any], sender: AicebergSender, store: ClaudeCodeStateStore,
+) -> dict[str, Any] | None:
+    sid = _get(data, "session_id")
+    prompt = _get(data, "prompt", "user_prompt")
+    if not sid or not prompt:
+        return None
 
-
-def synthetic_tool_key(turn_session_id: str, tool_name: str, tool_input: Any) -> str:
-    return f"synthetic:{fingerprint_tool_call(turn_session_id, tool_name, tool_input)}"
-
-
-def new_turn_session_id() -> str:
-    return f"turn-{uuid.uuid4()}"
-
-
-def thread_metadata(input_data: dict[str, Any], thread_id: str, **extra: str) -> dict[str, Any]:
-    return build_hook_metadata(
-        input_data,
-        claude_session_id=thread_id,
-        conversation_thread_id=thread_id,
-        **extra,
-    )
-
-
-async def close_and_delete(
-    sender: AicebergSender,
-    store: ClaudeCodeStateStore,
-    *,
-    scope: str,
-    event_key: str,
-    event: OpenAicebergEvent,
-    output: str | dict[str, Any],
-    metadata: dict[str, Any] | None = None,
-) -> None:
-    response = await sender.close_event(event, output=output, metadata=metadata)
-    if response.ok:
-        store.delete_event(scope, event_key)
-
-
-async def close_turn(
-    sender: AicebergSender,
-    store: ClaudeCodeStateStore,
-    *,
-    thread_id: str,
-    turn_session_id: str,
-    transcript_path: str = "",
-    fallback_output: str = "Claude finished without a captured final assistant message.",
-) -> None:
-    for tool_key, event in store.list_tool_events(turn_session_id):
-        await close_and_delete(
-            sender,
-            store,
-            scope="tool",
-            event_key=tool_key,
-            event=event,
-            output={
-                "hook_phase": "session_close",
-                "message": INCOMPLETE_TOOL_MESSAGE,
-            },
-        )
-
-    user_event = store.get_event("user", turn_session_id)
-    if user_event is not None:
-        output_text = extract_last_assistant_text(transcript_path) if transcript_path else ""
-        if not output_text:
-            output_text = fallback_output
-        await close_and_delete(
-            sender,
-            store,
-            scope="user",
-            event_key=turn_session_id,
-            event=user_event,
-            output=output_text,
-        )
-
-    if store.get_current_turn(thread_id) == turn_session_id:
-        store.clear_current_turn(thread_id)
-
-
-async def handle_user_prompt_submit(
-    sender: AicebergSender,
-    store: ClaudeCodeStateStore,
-    input_data: dict[str, Any],
-) -> dict[str, Any]:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    prompt = str(input_data.get("prompt", "")).strip()
-    append_hook_debug("UserPromptSubmit", input_data, note="received", session_id=thread_id)
-    if not thread_id or not prompt:
-        append_hook_debug("UserPromptSubmit", input_data, note="skipped_missing_prompt", session_id=thread_id)
-        return {}
-
-    existing_turn_id = store.get_current_turn(thread_id)
-    turn_session_id = new_turn_session_id()
-    store.set_current_turn(thread_id, turn_session_id)
-
-    if existing_turn_id:
-        await close_turn(
-            sender,
-            store,
-            thread_id=thread_id,
-            turn_session_id=existing_turn_id,
-            transcript_path=str(input_data.get("transcript_path", "")),
-            fallback_output="A new user turn started before the previous turn was explicitly finalized.",
-        )
-
-    response, open_event = await sender.create_event(
+    response, event = _sync(sender.create_event(
         label="user prompt",
         event_type=USER_EVENT_TYPE,
         content=prompt,
-        session_id=turn_session_id,
-        metadata=thread_metadata(input_data, thread_id),
+        session_id=sid,
+        metadata=_metadata(data),
         session_start=True,
-    )
-    if open_event is not None:
-        if response.blocked:
-            await sender.close_event(open_event, output=DEFAULT_BLOCK_CLOSE_MESSAGE)
-            if store.get_current_turn(thread_id) == turn_session_id:
-                store.clear_current_turn(thread_id)
-        else:
-            store.save_event("user", turn_session_id, open_event)
-            append_hook_debug(
-                "UserPromptSubmit",
-                input_data,
-                note="opened_turn_session",
-                session_id=thread_id,
-                turn_session_id=turn_session_id,
-            )
-    elif response.blocked:
-        if store.get_current_turn(thread_id) == turn_session_id:
-            store.clear_current_turn(thread_id)
+    ))
+    debug("UserPromptSubmit", "sent", sid=sid, event_id=response.event_id)
+
+    if response.blocked and event:
+        _sync(sender.close_event(event, output=BLOCK_MESSAGE))
+        debug("UserPromptSubmit", "closed_blocked", sid=sid)
+        return _block_result("UserPromptSubmit", response)
+    if event:
+        store.store_event(f"user:{sid}", event)
+        store.store_turn(sid, event.event_id)
+    return None
+
+
+def handle_pre_tool_use(
+    data: dict[str, Any], sender: AicebergSender, store: ClaudeCodeStateStore,
+) -> dict[str, Any] | None:
+    sid = _get(data, "session_id")
+    name = _get(data, "tool_name")
+    key = _tool_key(data)
+    if not sid or not name:
+        return None
+
+    tool_input = data.get("tool_input", data.get("input", {}))
+    payload = {"hook_phase": "pre_tool_use", "tool_name": name, "tool_input": tool_input}
+
+    response, event = _sync(sender.create_event(
+        label=f"tool {name}",
+        event_type=classify_tool_event(name),
+        content=payload,
+        session_id=sid,
+        metadata=_metadata(data, tool_name=name),
+    ))
+    debug("PreToolUse", "sent", sid=sid, tool=name, event_id=response.event_id)
+
+    if response.blocked and event:
+        _sync(sender.close_event(event, output=BLOCK_MESSAGE))
+        debug("PreToolUse", "closed_blocked", sid=sid, tool=name)
+        return _block_result("PreToolUse", response)
+    if event:
+        store.store_event(key, event)
+    return None
+
+
+def handle_post_tool(
+    data: dict[str, Any],
+    sender: AicebergSender,
+    store: ClaudeCodeStateStore,
+    *,
+    is_failure: bool = False,
+) -> dict[str, Any] | None:
+    """Handles both PostToolUse and PostToolUseFailure."""
+    key = _tool_key(data)
+    event = store.load_event(key)
+    if not event:
+        debug("PostTool", "no_open_event", key=key)
+        return None
+
+    name = _get(data, "tool_name")
+    phase = "post_tool_use_failure" if is_failure else "post_tool_use"
+    payload: dict[str, Any] = {
+        "hook_phase": phase, "tool_name": name,
+        "tool_input": data.get("tool_input", data.get("input", {})),
+    }
+    if is_failure:
+        payload["error"] = str(data.get("error", ""))
     else:
-        append_hook_debug(
-            "UserPromptSubmit",
-            input_data,
-            note="turn_open_not_persisted",
-            session_id=thread_id,
-            turn_session_id=turn_session_id,
+        payload["tool_response"] = data.get(
+            "tool_response", data.get("response", data.get("output")),
         )
 
-    if response.blocked:
-        return build_block_output(
-            "UserPromptSubmit",
-            response.message or "Prompt blocked by Aiceberg safety policy.",
-        )
-    return {}
+    response = _sync(sender.close_event(event, output=payload))
+    debug(phase, "closed", key=key, ok=response.ok)
+    if response.ok:
+        store.delete_event(key)
+    return None
 
 
-async def handle_pre_tool_use(
+def _close_session(
+    sid: str,
+    output: str,
     sender: AicebergSender,
     store: ClaudeCodeStateStore,
-    input_data: dict[str, Any],
-    tool_use_id: str | None,
-) -> dict[str, Any]:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    turn_session_id = store.get_current_turn(thread_id) or ""
-    tool_name = extract_tool_name(input_data)
-    tool_input = extract_tool_input(input_data)
-    raw_tool_use_id = extract_tool_use_id(input_data, tool_use_id)
-    tool_key = raw_tool_use_id
-    if not tool_key and turn_session_id and tool_name:
-        tool_key = synthetic_tool_key(turn_session_id, tool_name, tool_input)
-
-    append_hook_debug(
-        "PreToolUse",
-        input_data,
-        note="received",
-        session_id=thread_id,
-        turn_session_id=turn_session_id,
-        tool_name=tool_name,
-        tool_use_id=tool_key,
-        raw_tool_use_id=raw_tool_use_id,
-    )
-    if not turn_session_id or not tool_name or not tool_key:
-        append_hook_debug(
-            "PreToolUse",
-            input_data,
-            note="skipped_missing_tool_context",
-            session_id=thread_id,
-            turn_session_id=turn_session_id,
-            tool_name=tool_name,
-            tool_use_id=tool_key,
-            raw_tool_use_id=raw_tool_use_id,
-        )
-        return {}
-
-    response, open_event = await sender.create_event(
-        label=f"tool {tool_name}",
-        event_type=classify_tool_event(tool_name),
-        content=build_tool_payload(
-            "pre_tool_use",
-            tool_name=tool_name,
-            tool_input=tool_input,
-            tool_use_id=raw_tool_use_id,
-        ),
-        session_id=turn_session_id,
-        metadata=thread_metadata(input_data, thread_id, tool_name=tool_name, tool_use_id=raw_tool_use_id),
-    )
-    if open_event is not None:
-        if response.blocked:
-            await sender.close_event(open_event, output=DEFAULT_BLOCK_CLOSE_MESSAGE)
-        else:
-            store.save_event("tool", tool_key, open_event)
-            append_hook_debug(
-                "PreToolUse",
-                input_data,
-                note="stored_open_tool_event",
-                session_id=thread_id,
-                turn_session_id=turn_session_id,
-                tool_name=tool_name,
-                tool_use_id=tool_key,
-                raw_tool_use_id=raw_tool_use_id,
-            )
-    else:
-        append_hook_debug(
-            "PreToolUse",
-            input_data,
-            note="tool_open_not_persisted",
-            session_id=thread_id,
-            turn_session_id=turn_session_id,
-            tool_name=tool_name,
-            tool_use_id=tool_key,
-            raw_tool_use_id=raw_tool_use_id,
-        )
-
-    if response.blocked:
-        append_hook_debug(
-            "PreToolUse",
-            input_data,
-            note="blocked",
-            session_id=thread_id,
-            turn_session_id=turn_session_id,
-            tool_name=tool_name,
-            tool_use_id=tool_key,
-            raw_tool_use_id=raw_tool_use_id,
-        )
-        return build_block_output(
-            "PreToolUse",
-            response.message or f"{tool_name or 'tool'} blocked by Aiceberg safety policy.",
-        )
-    return {}
-
-
-async def handle_post_tool_use(
-    sender: AicebergSender,
-    store: ClaudeCodeStateStore,
-    input_data: dict[str, Any],
-    tool_use_id: str | None,
+    *,
+    hook_label: str = "Stop",
 ) -> None:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    turn_session_id = store.get_current_turn(thread_id) or ""
-    tool_name = extract_tool_name(input_data)
-    raw_tool_use_id = extract_tool_use_id(input_data, tool_use_id)
-    tool_key = raw_tool_use_id
-    tool_input = extract_tool_input(input_data)
-    append_hook_debug(
-        "PostToolUse",
-        input_data,
-        note="received",
-        session_id=thread_id,
-        turn_session_id=turn_session_id,
-        tool_name=tool_name,
-        tool_use_id=tool_key,
-        raw_tool_use_id=raw_tool_use_id,
+    """Close orphaned tool events and the user prompt for a session."""
+    for key, evt in store.all_events():
+        if key.startswith("tool:") and evt.session_id == sid:
+            resp = _sync(sender.close_event(
+                evt, output={"hook_phase": "session_close",
+                             "message": INCOMPLETE_TOOL_MESSAGE},
+            ))
+            if resp.ok:
+                store.delete_event(key)
+
+    user_event = store.load_event(f"user:{sid}")
+    if user_event:
+        resp = _sync(sender.close_event(user_event, output=output))
+        debug(hook_label, "closed_user", sid=sid, ok=resp.ok)
+        if resp.ok:
+            store.delete_event(f"user:{sid}")
+            store.delete_turn(sid)
+
+
+def handle_stop(
+    data: dict[str, Any], sender: AicebergSender, store: ClaudeCodeStateStore,
+) -> dict[str, Any] | None:
+    """Close the user-turn event with the assistant's final response."""
+    sid = _get(data, "session_id")
+    if not sid:
+        return None
+
+    output = _extract_last_assistant_text(data) or "session ended"
+    debug("Stop", "payload", sid=sid, keys=sorted(data.keys()),
+          has_last_assistant_message="last_assistant_message" in data,
+          output_preview=output[:200])
+
+    _close_session(sid, output, sender, store, hook_label="Stop")
+    return None
+
+
+def handle_stop_failure(
+    data: dict[str, Any], sender: AicebergSender, store: ClaudeCodeStateStore,
+) -> dict[str, Any] | None:
+    """Close the user-turn event when the turn ended due to an API error.
+
+    StopFailure fires instead of Stop on rate limits, auth failures, etc.
+    We close everything with the error info so events don't stay orphaned.
+    """
+    sid = _get(data, "session_id")
+    if not sid:
+        return None
+
+    error_type = _get(data, "error") or "unknown"
+    error_details = _get(data, "error_details")
+    last_msg = _extract_last_assistant_text(data)
+    output = last_msg or f"API error: {error_type}"
+    if error_details:
+        output = f"{output} ({error_details})"
+
+    debug("StopFailure", "payload", sid=sid, error=error_type,
+          error_details=error_details or None)
+
+    _close_session(sid, output, sender, store, hook_label="StopFailure")
+    return None
+
+
+def handle_subagent_start(
+    data: dict[str, Any], store: ClaudeCodeStateStore,
+) -> dict[str, Any] | None:
+    agent_id = _get(data, "agent_id")
+    if not agent_id:
+        return None
+    store.store_subagent(
+        agent_id, _get(data, "agent_type"), _get(data, "session_id"),
     )
-
-    event_key = tool_key
-    event = store.get_event("tool", tool_key) if tool_key else None
-    if event is None and turn_session_id and tool_name:
-        matched_event = store.find_matching_tool_event(turn_session_id, tool_name, tool_input)
-        if matched_event is not None:
-            event_key, event = matched_event
-    if event is None:
-        append_hook_debug(
-            "PostToolUse",
-            input_data,
-            note="no_open_tool_event_found",
-            session_id=thread_id,
-            turn_session_id=turn_session_id,
-            tool_name=tool_name,
-            tool_use_id=tool_key,
-            raw_tool_use_id=raw_tool_use_id,
-        )
-        return
-
-    await close_and_delete(
-        sender,
-        store,
-        scope="tool",
-        event_key=event_key,
-        event=event,
-        output=build_tool_payload(
-            "post_tool_use",
-            tool_name=tool_name,
-            tool_input=tool_input,
-            tool_use_id=raw_tool_use_id,
-            tool_response=extract_tool_response(input_data),
-        ),
-        metadata=thread_metadata(input_data, thread_id, tool_name=tool_name, tool_use_id=raw_tool_use_id),
-    )
-    append_hook_debug(
-        "PostToolUse",
-        input_data,
-        note="closed_tool_event",
-        session_id=thread_id,
-        turn_session_id=turn_session_id,
-        tool_name=tool_name,
-        tool_use_id=event_key,
-        raw_tool_use_id=raw_tool_use_id,
-    )
+    debug("SubagentStart", "registered", agent_id=agent_id)
+    return None
 
 
-async def handle_post_tool_use_failure(
+def handle_subagent_stop(
+    data: dict[str, Any], store: ClaudeCodeStateStore,
+) -> dict[str, Any] | None:
+    agent_id = _get(data, "agent_id")
+    if not agent_id:
+        return None
+    store.stop_subagent(agent_id, _get(data, "agent_transcript_path") or None)
+    debug("SubagentStop", "stopped", agent_id=agent_id)
+    return None
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+def dispatch_claude_code_hook(
+    hook_name: str,
+    data: dict[str, Any],
     sender: AicebergSender,
     store: ClaudeCodeStateStore,
-    input_data: dict[str, Any],
-    tool_use_id: str | None,
-) -> None:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    turn_session_id = store.get_current_turn(thread_id) or ""
-    tool_name = extract_tool_name(input_data)
-    raw_tool_use_id = extract_tool_use_id(input_data, tool_use_id)
-    tool_key = raw_tool_use_id
-    tool_input = extract_tool_input(input_data)
-    append_hook_debug(
-        "PostToolUseFailure",
-        input_data,
-        note="received",
-        session_id=thread_id,
-        turn_session_id=turn_session_id,
-        tool_name=tool_name,
-        tool_use_id=tool_key,
-        raw_tool_use_id=raw_tool_use_id,
-    )
-
-    event_key = tool_key
-    event = store.get_event("tool", tool_key) if tool_key else None
-    if event is None and turn_session_id and tool_name:
-        matched_event = store.find_matching_tool_event(turn_session_id, tool_name, tool_input)
-        if matched_event is not None:
-            event_key, event = matched_event
-    if event is None:
-        append_hook_debug(
-            "PostToolUseFailure",
-            input_data,
-            note="no_open_tool_event_found",
-            session_id=thread_id,
-            turn_session_id=turn_session_id,
-            tool_name=tool_name,
-            tool_use_id=tool_key,
-            raw_tool_use_id=raw_tool_use_id,
-        )
-        return
-
-    await close_and_delete(
-        sender,
-        store,
-        scope="tool",
-        event_key=event_key,
-        event=event,
-        output=build_tool_payload(
-            "post_tool_use_failure",
-            tool_name=tool_name,
-            tool_input=tool_input,
-            tool_use_id=raw_tool_use_id,
-            error=extract_tool_error(input_data),
-        ),
-        metadata=thread_metadata(input_data, thread_id, tool_name=tool_name, tool_use_id=raw_tool_use_id),
-    )
-    append_hook_debug(
-        "PostToolUseFailure",
-        input_data,
-        note="closed_tool_event",
-        session_id=thread_id,
-        turn_session_id=turn_session_id,
-        tool_name=tool_name,
-        tool_use_id=event_key,
-        raw_tool_use_id=raw_tool_use_id,
-    )
-
-
-async def handle_stop(
-    sender: AicebergSender,
-    store: ClaudeCodeStateStore,
-    input_data: dict[str, Any],
-) -> None:
-    if input_data.get("stop_hook_active"):
-        return
-
-    thread_id = str(input_data.get("session_id", "")).strip()
-    turn_session_id = store.get_current_turn(thread_id) or ""
-    append_hook_debug("Stop", input_data, note="received", session_id=thread_id, turn_session_id=turn_session_id)
-    if not thread_id or not turn_session_id:
-        return
-
-    await close_turn(
-        sender,
-        store,
-        thread_id=thread_id,
-        turn_session_id=turn_session_id,
-        transcript_path=str(input_data.get("transcript_path", "")),
-        fallback_output="Claude finished without a captured final assistant message.",
-    )
-
-
-async def handle_session_start(input_data: dict[str, Any]) -> None:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    append_hook_debug("SessionStart", input_data, note="observed", session_id=thread_id)
-
-
-async def handle_session_end(input_data: dict[str, Any]) -> None:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    append_hook_debug("SessionEnd", input_data, note="observed", session_id=thread_id)
-
-
-async def handle_subagent_stop(input_data: dict[str, Any]) -> None:
-    thread_id = str(input_data.get("session_id", "")).strip()
-    append_hook_debug("SubagentStop", input_data, note="observed", session_id=thread_id)
-
-
-async def dispatch_claude_code_hook(
-    sender: AicebergSender,
-    store: ClaudeCodeStateStore,
-    input_data: dict[str, Any],
-) -> dict[str, Any]:
-    hook_name = str(input_data.get("hook_event_name", "")).strip()
-    tool_use_id = extract_tool_use_id(input_data) or None
-
-    if hook_name == "SessionStart":
-        await handle_session_start(input_data)
-        return {}
+) -> dict[str, Any] | None:
     if hook_name == "UserPromptSubmit":
-        return await handle_user_prompt_submit(sender, store, input_data)
+        return handle_user_prompt_submit(data, sender, store)
     if hook_name == "PreToolUse":
-        return await handle_pre_tool_use(sender, store, input_data, tool_use_id)
+        return handle_pre_tool_use(data, sender, store)
     if hook_name == "PostToolUse":
-        await handle_post_tool_use(sender, store, input_data, tool_use_id)
-        return {}
+        return handle_post_tool(data, sender, store, is_failure=False)
     if hook_name == "PostToolUseFailure":
-        await handle_post_tool_use_failure(sender, store, input_data, tool_use_id)
-        return {}
+        return handle_post_tool(data, sender, store, is_failure=True)
     if hook_name == "Stop":
-        await handle_stop(sender, store, input_data)
-        return {}
-    if hook_name == "SessionEnd":
-        await handle_session_end(input_data)
-        return {}
+        return handle_stop(data, sender, store)
+    if hook_name == "StopFailure":
+        return handle_stop_failure(data, sender, store)
+    if hook_name == "SubagentStart":
+        return handle_subagent_start(data, store)
     if hook_name == "SubagentStop":
-        await handle_subagent_stop(input_data)
-        return {}
-    return {}
+        return handle_subagent_stop(data, store)
+    debug(hook_name, "skipped")
+    return None
 
 
-async def main() -> int:
+# ── CLI entrypoint ───────────────────────────────────────────────────────────
+
+def run_cli(
+    hook_name: str, input_data: dict[str, Any], workspace: str | None = None,
+) -> dict[str, Any] | None:
+    init_debug(workspace)
+    paths = workspace_paths(workspace)
+    sender = AicebergSender()
+    store = ClaudeCodeStateStore(paths.state_db_path)
     try:
-        input_data = json.load(sys.stdin)
+        input_data["hook_event_name"] = hook_name
+        return dispatch_claude_code_hook(hook_name, input_data, sender, store)
+    finally:
+        store.close()
+
+
+def cli_main() -> None:
+    """Entrypoint for claude-aiceberg-hook console script."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="claude-aiceberg-hook")
+    parser.add_argument("hook_name", nargs="?")
+    parser.add_argument("--workspace", default=None)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if args.debug:
+        os.environ[AICEBERG_HOOK_DEBUG_ENV] = "1"
+
+    raw = sys.stdin.read().strip()
+    if not raw:
+        return
+
+    try:
+        input_data = json.loads(raw)
     except json.JSONDecodeError:
-        print("[claude-code-aiceberg] expected JSON hook input on stdin", file=sys.stderr)
-        return 1
+        print(json.dumps({"error": "invalid JSON on stdin"}))
+        return
 
-    sender = AicebergSender(debug=False)
-    store = ClaudeCodeStateStore()
-    output = await dispatch_claude_code_hook(sender, store, input_data)
-    if output:
-        print(json.dumps(output))
-    return 0
+    hook_name = args.hook_name or input_data.get("hook_event_name", "")
+    if not hook_name:
+        return
 
-
-if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    result = run_cli(hook_name, input_data, workspace=args.workspace)
+    if result is not None:
+        print(json.dumps(result, ensure_ascii=True))

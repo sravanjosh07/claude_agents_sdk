@@ -1,36 +1,38 @@
-#!/usr/bin/env python3
 """
-Stateful workflow for Claude hook monitoring.
+Stateful event lifecycle for Claude + Aiceberg hook monitoring.
 
-This module decides which hooks currently send live Aiceberg traffic and how
-fallback closing should work when Claude exits early.
+Tracks open Aiceberg events (prompts, tools), subagents, and handles
+close/fallback logic when Claude finishes or errors out.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .sender import AicebergResponse, AicebergSender, OpenAicebergEvent
 
+# ── Event types ──────────────────────────────────────────────────────────────
 
 AGENT_EVENT_TYPE = "agt_agt"
 TOOL_EVENT_TYPE = "agt_tool"
 USER_EVENT_TYPE = "user_agt"
 
-LIVE_AICEBERG_HOOKS = {
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "PostToolUseFailure",
-}
-DEFAULT_AICEBERG_USER_ID = os.getenv("AICEBERG_USER_ID", "claudeagent").strip() or "claudeagent"
-DEFAULT_BLOCK_CLOSE_MESSAGE = (
-    os.getenv("AICEBERG_BLOCK_MESSAGE", "This request was blocked by Aiceberg safety policy.").strip()
+# Hooks that actually open/close Aiceberg events or track subagents.
+LIVE_HOOKS = frozenset({
+    "UserPromptSubmit", "PreToolUse", "PostToolUse",
+    "PostToolUseFailure", "SubagentStart", "SubagentStop",
+})
+
+DEFAULT_USER_ID = os.getenv("AICEBERG_USER_ID", "claudeagent").strip() or "claudeagent"
+BLOCK_MESSAGE = (
+    os.getenv("AICEBERG_BLOCK_MESSAGE",
+              "This request was blocked by Aiceberg safety policy.").strip()
     or "This request was blocked by Aiceberg safety policy."
 )
-FALLBACK_FAILURE_MESSAGE = (
+FAILURE_MESSAGE = (
     "This run ended before a final assistant answer was safely completed. "
     "Claude reported a runtime or quota error."
 )
@@ -39,20 +41,31 @@ INCOMPLETE_TOOL_MESSAGE = (
 )
 
 
-def build_hook_metadata(input_data: dict[str, Any], **extra: str) -> dict[str, Any]:
-    metadata = {
-        "hook_event_name": str(input_data.get("hook_event_name", "")).strip(),
-        "user_id": DEFAULT_AICEBERG_USER_ID,
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def classify_tool_event(tool_name: str) -> str:
+    """Agent/Task tools get agt_agt, everything else gets agt_tool."""
+    return AGENT_EVENT_TYPE if tool_name in {"Agent", "Task"} else TOOL_EVENT_TYPE
+
+
+def _get(data: dict[str, Any], key: str) -> str:
+    return str(data.get(key, "")).strip()
+
+
+def _metadata(data: dict[str, Any], **extra: str) -> dict[str, Any]:
+    md: dict[str, Any] = {
+        "hook_event_name": _get(data, "hook_event_name"),
+        "user_id": DEFAULT_USER_ID,
     }
-    for key, value in extra.items():
-        text = str(value).strip()
+    for k, v in extra.items():
+        text = str(v).strip()
         if text:
-            metadata[key] = text
-    return metadata
+            md[k] = text
+    return md
 
 
-def build_tool_payload(
-    hook_phase: str,
+def _tool_payload(
+    phase: str,
     *,
     tool_name: str,
     tool_input: Any,
@@ -60,295 +73,309 @@ def build_tool_payload(
     tool_response: Any = None,
     error: str = "",
 ) -> dict[str, Any]:
-    payload = {
-        "hook_phase": hook_phase,
-        "tool_name": tool_name,
-        "tool_input": tool_input,
+    p: dict[str, Any] = {
+        "hook_phase": phase, "tool_name": tool_name, "tool_input": tool_input,
     }
     if tool_use_id:
-        payload["tool_use_id"] = tool_use_id
-    if hook_phase == "post_tool_use":
-        payload["tool_response"] = tool_response
-    if hook_phase == "post_tool_use_failure" and error:
-        payload["error"] = error
-    return payload
+        p["tool_use_id"] = tool_use_id
+    if phase == "post_tool_use":
+        p["tool_response"] = tool_response
+    if phase == "post_tool_use_failure" and error:
+        p["error"] = error
+    return p
 
 
-def classify_tool_event(tool_name: str) -> str:
-    if tool_name in {"Agent", "Task"}:
-        return AGENT_EVENT_TYPE
-    return TOOL_EVENT_TYPE
+# ── Subagent record ─────────────────────────────────────────────────────────
 
+@dataclass
+class SubagentRecord:
+    """Tracks one subagent from start to stop."""
+    agent_id: str
+    agent_type: str
+    parent_session_id: str
+    started_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    stopped_at: str | None = None
+    transcript_path: str | None = None
+
+
+# ── Workflow ─────────────────────────────────────────────────────────────────
 
 class ClaudeAicebergWorkflow:
-    """Owns event state and the hook-to-Aiceberg mapping rules."""
+    """Owns open-event state and the hook -> Aiceberg mapping rules."""
 
     def __init__(self, sender: AicebergSender | None = None) -> None:
         self.sender = sender or AicebergSender()
         self.user_events: dict[str, OpenAicebergEvent] = {}
         self.tool_events: dict[str, OpenAicebergEvent] = {}
-        self.blocked_events: list[OpenAicebergEvent] = []
         self.started_sessions: set[str] = set()
         self.latest_session_id: str | None = None
+        self.subagents: dict[str, SubagentRecord] = {}
 
     @property
     def is_dry_run(self) -> bool:
         return self.sender.dry_run
 
-    async def handle_user_prompt_submit(self, input_data: dict[str, Any]) -> AicebergResponse:
-        session_id = self._session_id(input_data)
-        prompt = self._prompt_text(input_data)
-        if not session_id or not prompt:
+    # ── Prompt ───────────────────────────────────────────────────────────
+
+    async def handle_user_prompt_submit(
+        self, data: dict[str, Any],
+    ) -> AicebergResponse:
+        sid = _get(data, "session_id")
+        prompt = str(data.get("prompt", data.get("user_prompt", ""))).strip()
+        if not sid or not prompt:
             return AicebergResponse(ok=True, message="skipped_missing_prompt")
 
-        return await self._open_event(
-            store=self.user_events,
-            store_key=session_id,
+        self.latest_session_id = sid
+        is_new = sid not in self.started_sessions
+        response, event = await self.sender.create_event(
             label="user prompt",
             event_type=USER_EVENT_TYPE,
             content=prompt,
-            session_id=session_id,
-            metadata=build_hook_metadata(input_data),
-            session_start=session_id not in self.started_sessions,
-            after_store=lambda: self.started_sessions.add(session_id),
-        )
-
-    async def handle_pre_tool_use(self, input_data: dict[str, Any], tool_use_id: str | None) -> AicebergResponse:
-        session_id = self._session_id(input_data)
-        tool_name = self._tool_name(input_data)
-        tool_use_key = self._tool_use_key(input_data, tool_use_id)
-        if not session_id or not tool_name or not tool_use_key:
-            return AicebergResponse(ok=True, message="skipped_missing_tool_context")
-
-        return await self._open_event(
-            store=self.tool_events,
-            store_key=tool_use_key,
-            label=f"tool {tool_name}",
-            event_type=classify_tool_event(tool_name),
-            content=self._tool_payload("pre_tool_use", input_data, tool_use_key),
-            session_id=session_id,
-            metadata=self._tool_metadata(input_data, tool_name, tool_use_key),
-        )
-
-    async def handle_post_tool_use(self, input_data: dict[str, Any], tool_use_id: str | None) -> None:
-        tool_use_key = self._tool_use_key(input_data, tool_use_id)
-        if not tool_use_key:
-            return
-
-        tool_name = self._tool_name(input_data)
-        await self._close_event(
-            store=self.tool_events,
-            store_key=tool_use_key,
-            output=self._tool_payload("post_tool_use", input_data, tool_use_key),
-            metadata=self._tool_metadata(input_data, tool_name, tool_use_key),
-        )
-
-    async def handle_post_tool_use_failure(self, input_data: dict[str, Any], tool_use_id: str | None) -> None:
-        tool_use_key = self._tool_use_key(input_data, tool_use_id)
-        if not tool_use_key:
-            return
-
-        tool_name = self._tool_name(input_data)
-        await self._close_event(
-            store=self.tool_events,
-            store_key=tool_use_key,
-            output=self._tool_payload("post_tool_use_failure", input_data, tool_use_key),
-            metadata=self._tool_metadata(input_data, tool_name, tool_use_key),
-        )
-
-    async def handle_permission_request(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_stop(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_session_start(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_session_end(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_subagent_start(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_subagent_stop(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_pre_compact(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def handle_notification(self, input_data: dict[str, Any]) -> AicebergResponse:
-        return self._skip_non_live_hook(input_data)
-
-    async def complete_user_turn(self, session_id: str, output_text: str) -> None:
-        await self.flush_blocked_events(session_id)
-        await self._close_session_tool_events(
-            session_id,
-            message=INCOMPLETE_TOOL_MESSAGE,
-            hook_phase="session_close",
-        )
-        if not output_text.strip():
-            return
-        await self._close_event(
-            store=self.user_events,
-            store_key=session_id,
-            output=output_text,
-        )
-
-    async def fail_session(self, session_id: str, detail: str) -> None:
-        if not session_id:
-            return
-
-        await self.flush_blocked_events(session_id)
-        fallback_output = f"{FALLBACK_FAILURE_MESSAGE}\n\nDetails: {detail}"
-        await self._close_event(
-            store=self.user_events,
-            store_key=session_id,
-            output=fallback_output,
-        )
-        await self._close_session_tool_events(
-            session_id,
-            message=fallback_output,
-            hook_phase="fallback_close",
-        )
-
-    async def flush_blocked_events(self, session_id: str | None = None) -> None:
-        remaining: list[OpenAicebergEvent] = []
-        for event in self.blocked_events:
-            if session_id and event.session_id != session_id:
-                remaining.append(event)
-                continue
-
-            response = await self.sender.close_event(event, output=DEFAULT_BLOCK_CLOSE_MESSAGE)
-            if not response.ok:
-                self._log_close_failure(event, response)
-                remaining.append(event)
-
-        self.blocked_events = remaining
-
-    def report_unresolved_events(self) -> None:
-        pending = [*self.user_events.values(), *self.tool_events.values(), *self.blocked_events]
-        if not pending:
-            return
-
-        print("[claude-aiceberg-workflow] unresolved Aiceberg events remain open:")
-        for event in pending:
-            print(
-                f"  - {event.label}: event_id={event.event_id} "
-                f"event_type={event.event_type} session_id={event.session_id}"
-            )
-
-    async def _open_event(
-        self,
-        *,
-        store: dict[str, OpenAicebergEvent],
-        store_key: str,
-        label: str,
-        event_type: str,
-        content: str | dict[str, Any] | list[Any],
-        session_id: str,
-        metadata: dict[str, Any] | None = None,
-        session_start: bool = False,
-        after_store: Callable[[], None] | None = None,
-    ) -> AicebergResponse:
-        self.latest_session_id = session_id
-        response, open_event = await self.sender.create_event(
-            label=label,
-            event_type=event_type,
-            content=content,
-            session_id=session_id,
-            metadata=metadata,
-            session_start=session_start,
+            session_id=sid,
+            metadata=_metadata(data),
+            session_start=is_new,
         )
         if response.blocked:
-            self._queue_blocked_event(open_event)
+            if event:
+                await self.sender.close_event(event, output=BLOCK_MESSAGE)
             return response
-        if open_event:
-            store[store_key] = open_event
-            if after_store:
-                after_store()
+        if event:
+            self.user_events[sid] = event
+            self.started_sessions.add(sid)
         return response
 
-    async def _close_event(
-        self,
-        *,
-        store: dict[str, OpenAicebergEvent],
-        store_key: str,
-        output: str | dict[str, Any] | list[Any],
-        metadata: dict[str, Any] | None = None,
+    # ── Tools ────────────────────────────────────────────────────────────
+
+    async def handle_pre_tool_use(
+        self, data: dict[str, Any], tool_use_id: str | None,
+    ) -> AicebergResponse:
+        sid = _get(data, "session_id")
+        name = _get(data, "tool_name")
+        key = str(tool_use_id or data.get("tool_use_id", "")).strip()
+        if not sid or not name or not key:
+            return AicebergResponse(ok=True, message="skipped_missing_tool_context")
+
+        self.latest_session_id = sid
+        response, event = await self.sender.create_event(
+            label=f"tool {name}",
+            event_type=classify_tool_event(name),
+            content=_tool_payload(
+                "pre_tool_use", tool_name=name,
+                tool_input=data.get("tool_input", {}), tool_use_id=key,
+            ),
+            session_id=sid,
+            metadata=self._tool_meta(data, name, key),
+        )
+        if response.blocked:
+            if event:
+                await self.sender.close_event(event, output=BLOCK_MESSAGE)
+            return response
+        if event:
+            self.tool_events[key] = event
+        return response
+
+    async def handle_post_tool_use(
+        self, data: dict[str, Any], tool_use_id: str | None,
     ) -> None:
-        event = store.get(store_key)
+        await self._close_tool(data, tool_use_id, "post_tool_use")
+
+    async def handle_post_tool_use_failure(
+        self, data: dict[str, Any], tool_use_id: str | None,
+    ) -> None:
+        await self._close_tool(data, tool_use_id, "post_tool_use_failure")
+
+    async def _close_tool(
+        self, data: dict[str, Any], tool_use_id: str | None, phase: str,
+    ) -> None:
+        key = str(tool_use_id or data.get("tool_use_id", "")).strip()
+        event = self.tool_events.get(key) if key else None
         if not event:
             return
+        name = _get(data, "tool_name")
+        resp = await self.sender.close_event(
+            event,
+            output=_tool_payload(
+                phase, tool_name=name,
+                tool_input=data.get("tool_input", {}), tool_use_id=key,
+                tool_response=data.get("tool_response"),
+                error=str(data.get("error", "")),
+            ),
+            metadata=self._tool_meta(data, name, key),
+        )
+        if resp.ok:
+            self.tool_events.pop(key, None)
 
-        response = await self.sender.close_event(event, output=output, metadata=metadata)
-        if response.ok:
-            store.pop(store_key, None)
+    # ── Subagents ────────────────────────────────────────────────────────
+
+    async def handle_subagent_start(
+        self, data: dict[str, Any],
+    ) -> AicebergResponse:
+        sid = _get(data, "session_id")
+        agent_id = _get(data, "agent_id")
+        self.latest_session_id = sid or self.latest_session_id
+        if not agent_id:
+            return AicebergResponse(ok=True, message="skipped_missing_agent_id")
+        self.subagents[agent_id] = SubagentRecord(
+            agent_id=agent_id,
+            agent_type=_get(data, "agent_type"),
+            parent_session_id=sid,
+        )
+        return AicebergResponse(ok=True, message=f"subagent_registered:{agent_id}")
+
+    async def handle_subagent_stop(
+        self, data: dict[str, Any],
+    ) -> AicebergResponse:
+        sid = _get(data, "session_id")
+        agent_id = _get(data, "agent_id")
+        self.latest_session_id = sid or self.latest_session_id
+        record = self.subagents.get(agent_id)
+        if record:
+            record.stopped_at = datetime.now(timezone.utc).isoformat()
+            record.transcript_path = _get(data, "agent_transcript_path") or None
+        return AicebergResponse(ok=True, message=f"subagent_stopped:{agent_id}")
+
+    def list_subagents(self) -> list[SubagentRecord]:
+        return list(self.subagents.values())
+
+    # ── Stop (SDK path) ────────────────────────────────────────────────
+
+    async def handle_stop(self, data: dict[str, Any]) -> AicebergResponse:
+        """Close the user event when the SDK fires a Stop hook.
+
+        The SDK's Stop data may include `last_assistant_message`.
+        If the runner already called complete_user_turn(), the user event
+        will be gone and this is a harmless no-op.
+        """
+        sid = _get(data, "session_id") or self.latest_session_id
+        if not sid:
+            return AicebergResponse(ok=True, message="skipped:Stop:no_session")
+
+        output = str(data.get("last_assistant_message", "")).strip()
+        if not output:
+            return AicebergResponse(ok=True, message="skipped:Stop:no_text")
+
+        # Close any orphaned tool events, then close the user event.
+        await self._close_session_tools(sid, INCOMPLETE_TOOL_MESSAGE)
+        event = self.user_events.get(sid)
+        if not event:
+            return AicebergResponse(ok=True, message="skipped:Stop:already_closed")
+
+        resp = await self.sender.close_event(event, output=output)
+        if resp.ok:
+            self.user_events.pop(sid, None)
+        return resp
+
+    async def handle_stop_failure(self, data: dict[str, Any]) -> AicebergResponse:
+        """Close the user event when the turn ends due to an API error.
+
+        StopFailure fires instead of Stop on rate limits, auth failures, etc.
+        We close everything with the error info so events don't stay orphaned.
+        """
+        sid = _get(data, "session_id") or self.latest_session_id
+        if not sid:
+            return AicebergResponse(ok=True, message="skipped:StopFailure:no_session")
+
+        error_type = _get(data, "error") or "unknown"
+        error_details = _get(data, "error_details")
+        last_msg = str(data.get("last_assistant_message", "")).strip()
+        output = last_msg or f"API error: {error_type}"
+        if error_details:
+            output = f"{output} ({error_details})"
+
+        await self._close_session_tools(sid, INCOMPLETE_TOOL_MESSAGE)
+        event = self.user_events.get(sid)
+        if not event:
+            return AicebergResponse(ok=True, message="skipped:StopFailure:already_closed")
+
+        resp = await self.sender.close_event(event, output=output)
+        if resp.ok:
+            self.user_events.pop(sid, None)
+        return resp
+
+    # ── Noop (hooks we register but don't act on yet) ────────────────────
+
+    async def handle_noop(self, data: dict[str, Any]) -> AicebergResponse:
+        hook = _get(data, "hook_event_name")
+        sid = _get(data, "session_id")
+        self.latest_session_id = sid or self.latest_session_id
+        return AicebergResponse(ok=True, message=f"skipped:{hook or 'unknown'}")
+
+    # ── Session close helpers ────────────────────────────────────────────
+
+    async def complete_user_turn(
+        self, session_id: str, output_text: str,
+    ) -> None:
+        """Close all events for a finished turn."""
+        await self._close_session_tools(session_id, INCOMPLETE_TOOL_MESSAGE)
+        if not output_text.strip():
             return
-        self._log_close_failure(event, response)
-
-    def _queue_blocked_event(self, event: OpenAicebergEvent | None) -> None:
+        event = self.user_events.get(session_id)
         if event:
-            self.blocked_events.append(event)
+            resp = await self.sender.close_event(event, output=output_text)
+            if resp.ok:
+                self.user_events.pop(session_id, None)
 
-    async def _close_session_tool_events(self, session_id: str, *, message: str, hook_phase: str) -> None:
-        tool_keys = [tool_use_id for tool_use_id, event in self.tool_events.items() if event.session_id == session_id]
-        for tool_use_id in tool_keys:
-            await self._close_event(
-                store=self.tool_events,
-                store_key=tool_use_id,
-                output={
-                    "hook_phase": hook_phase,
-                    "tool_use_id": tool_use_id,
-                    "message": message,
-                },
+    async def fail_session(self, session_id: str, detail: str) -> None:
+        """Close everything with a failure message."""
+        if not session_id:
+            return
+        msg = f"{FAILURE_MESSAGE}\n\nDetails: {detail}"
+        event = self.user_events.get(session_id)
+        if event:
+            resp = await self.sender.close_event(event, output=msg)
+            if resp.ok:
+                self.user_events.pop(session_id, None)
+        await self._close_session_tools(session_id, msg)
+
+    def report_unresolved_events(self) -> None:
+        pending = [
+            *self.user_events.values(),
+            *self.tool_events.values(),
+        ]
+        if not pending:
+            return
+        print("[aiceberg] unresolved events remain open:")
+        for e in pending:
+            print(f"  - {e.label}: event_id={e.event_id} session={e.session_id}")
+
+    def report_subagents(self) -> None:
+        if not self.subagents:
+            return
+        print(f"[aiceberg] tracked {len(self.subagents)} subagent(s):")
+        for r in self.subagents.values():
+            status = "stopped" if r.stopped_at else "running"
+            print(f"  - {r.agent_id} type={r.agent_type} status={status}")
+
+    # ── Internal ─────────────────────────────────────────────────────────
+
+    async def _close_session_tools(
+        self, session_id: str, message: str,
+    ) -> None:
+        keys = [k for k, e in self.tool_events.items()
+                if e.session_id == session_id]
+        for k in keys:
+            event = self.tool_events.get(k)
+            if not event:
+                continue
+            resp = await self.sender.close_event(
+                event,
+                output={"hook_phase": "session_close", "tool_use_id": k,
+                        "message": message},
             )
+            if resp.ok:
+                self.tool_events.pop(k, None)
 
     @staticmethod
-    def _prompt_text(input_data: dict[str, Any]) -> str:
-        return str(input_data.get("prompt", input_data.get("user_prompt", ""))).strip()
-
-    @staticmethod
-    def _tool_name(input_data: dict[str, Any]) -> str:
-        return str(input_data.get("tool_name", "")).strip()
-
-    @staticmethod
-    def _tool_payload(hook_phase: str, input_data: dict[str, Any], tool_use_key: str) -> dict[str, Any]:
-        return build_tool_payload(
-            hook_phase,
-            tool_name=str(input_data.get("tool_name", "")).strip(),
-            tool_input=input_data.get("tool_input", {}) or {},
-            tool_use_id=tool_use_key,
-            tool_response=input_data.get("tool_response"),
-            error=str(input_data.get("error", "")),
-        )
-
-    @staticmethod
-    def _tool_metadata(input_data: dict[str, Any], tool_name: str, tool_use_key: str) -> dict[str, Any]:
-        return build_hook_metadata(
-            input_data,
-            tool_name=tool_name,
-            tool_use_id=tool_use_key,
-        )
-
-    @staticmethod
-    def _session_id(input_data: dict[str, Any]) -> str:
-        return str(input_data.get("session_id", "")).strip()
-
-    @staticmethod
-    def _tool_use_key(input_data: dict[str, Any], tool_use_id: str | None) -> str:
-        return str(tool_use_id or input_data.get("tool_use_id", "")).strip()
-
-    def _skip_non_live_hook(self, input_data: dict[str, Any]) -> AicebergResponse:
-        hook_name = str(input_data.get("hook_event_name", "")).strip()
-        session_id = self._session_id(input_data)
-        self.latest_session_id = session_id or self.latest_session_id
-        if hook_name and hook_name not in LIVE_AICEBERG_HOOKS:
-            return AicebergResponse(ok=True, message=f"skipped_non_live_hook:{hook_name}")
-        return AicebergResponse(ok=True, message="skipped_non_live_hook")
-
-    @staticmethod
-    def _log_close_failure(event: OpenAicebergEvent, response: AicebergResponse) -> None:
-        status = f" status={response.status_code}" if response.status_code is not None else ""
-        detail = response.message or "unknown error"
-        print(f"[claude-aiceberg-workflow] close failed for {event.label}:{status} {detail}")
+    def _tool_meta(
+        data: dict[str, Any], tool_name: str, tool_use_key: str,
+    ) -> dict[str, Any]:
+        extra: dict[str, str] = {
+            "tool_name": tool_name, "tool_use_id": tool_use_key,
+        }
+        for f in ("agent_id", "agent_type"):
+            val = _get(data, f)
+            if val:
+                extra[f] = val
+        return _metadata(data, **extra)

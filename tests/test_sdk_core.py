@@ -1,339 +1,325 @@
+"""Tests for the SDK path: sender, workflow, hooks, registry."""
+
 from __future__ import annotations
 
-import sys
-import time
+import asyncio
 import unittest
-from pathlib import Path
+from unittest.mock import patch
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from claude_aiceberg import (  # noqa: E402
-    AicebergResponse,
-    AicebergSender,
+from claude_aiceberg.sender import AicebergResponse, AicebergSender, serialize_content
+from claude_aiceberg.workflow import (
     ClaudeAicebergWorkflow,
-    ClaudeHookCallbacks,
-    SUPPORTED_HOOK_EVENTS,
-    build_hook_registry,
+    SubagentRecord,
+    classify_tool_event,
 )
-from claude_aiceberg.workflow import AGENT_EVENT_TYPE, TOOL_EVENT_TYPE, classify_tool_event  # noqa: E402
+from claude_aiceberg.hooks import (
+    SUPPORTED_HOOK_EVENTS,
+    build_block_output,
+    build_hook_registry,
+    dispatch_hook,
+)
 
-from tests.helpers import FakeSender  # noqa: E402
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+from helpers import FakeSender
 
 
-class SenderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dry_run_create_returns_event_id(self) -> None:
-        sender = AicebergSender(dry_run=True, debug=False, min_event_gap_seconds=0)
-        response, open_event = await sender.create_event(
-            label="user prompt",
-            event_type="user_agt",
-            content="hello",
-            session_id="s1",
-            metadata={"hook_event_name": "UserPromptSubmit"},
-            session_start=True,
+def run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+# ── Sender ───────────────────────────────────────────────────────────────────
+
+class SenderTests(unittest.TestCase):
+
+    def test_serialize_string(self):
+        self.assertEqual(serialize_content("hello"), "hello")
+
+    def test_serialize_dict(self):
+        result = serialize_content({"b": 2, "a": 1})
+        self.assertIn('"a": 1', result)
+
+    def test_dry_run_explicit(self):
+        s = AicebergSender(dry_run=True)
+        self.assertTrue(s.dry_run)
+        s2 = AicebergSender(dry_run=False)
+        self.assertFalse(s2.dry_run)
+
+    def test_create_close_dry_run(self):
+        s = AicebergSender(dry_run=True, api_key="k", use_case_id="u")
+        resp, event = run(s.create_event(
+            label="test", event_type="user_agt",
+            content="hi", session_id="s1",
+        ))
+        self.assertTrue(resp.ok)
+        self.assertIsNotNone(event)
+        close_resp = run(s.close_event(event, output="bye"))
+        self.assertTrue(close_resp.ok)
+
+
+# ── Workflow ─────────────────────────────────────────────────────────────────
+
+class WorkflowTests(unittest.TestCase):
+
+    def _wf(self):
+        sender = FakeSender()
+        wf = ClaudeAicebergWorkflow(sender)
+        return wf, sender
+
+    def test_prompt_opens_event(self):
+        wf, sender = self._wf()
+        resp = run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "hello",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        self.assertTrue(resp.ok)
+        self.assertIn("s1", wf.user_events)
+        self.assertEqual(len(sender.created), 1)
+
+    def test_empty_prompt_skips(self):
+        wf, sender = self._wf()
+        resp = run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "",
+        }))
+        self.assertEqual(resp.message, "skipped_missing_prompt")
+        self.assertEqual(len(sender.created), 0)
+
+    def test_tool_open_close(self):
+        wf, _ = self._wf()
+        resp = run(wf.handle_pre_tool_use(
+            {"session_id": "s1", "tool_name": "Read",
+             "hook_event_name": "PreToolUse"},
+            tool_use_id="t1",
+        ))
+        self.assertTrue(resp.ok)
+        self.assertIn("t1", wf.tool_events)
+
+        run(wf.handle_post_tool_use(
+            {"session_id": "s1", "tool_name": "Read",
+             "tool_response": "content"},
+            tool_use_id="t1",
+        ))
+        self.assertNotIn("t1", wf.tool_events)
+
+    def test_tool_failure_close(self):
+        wf, _ = self._wf()
+        run(wf.handle_pre_tool_use(
+            {"session_id": "s1", "tool_name": "Bash",
+             "hook_event_name": "PreToolUse"},
+            tool_use_id="t2",
+        ))
+        run(wf.handle_post_tool_use_failure(
+            {"session_id": "s1", "tool_name": "Bash", "error": "boom"},
+            tool_use_id="t2",
+        ))
+        self.assertNotIn("t2", wf.tool_events)
+
+    def test_blocked_prompt(self):
+        wf, sender = self._wf()
+        sender.create_responses.append(
+            AicebergResponse(ok=True, event_result="blocked", event_id="b1"),
         )
-        self.assertTrue(response.ok)
-        self.assertIsNotNone(response.event_id)
-        self.assertIsNotNone(open_event)
+        resp = run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "bad",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        self.assertTrue(resp.blocked)
+        # Blocked events are closed immediately, not stored as open.
+        self.assertNotIn("s1", wf.user_events)
+        self.assertEqual(len(sender.closed), 1)
 
-    async def test_dry_run_close_reuses_linked_event_id(self) -> None:
-        sender = AicebergSender(dry_run=True, debug=False, min_event_gap_seconds=0)
-        _, open_event = await sender.create_event(
-            label="user prompt",
-            event_type="user_agt",
-            content="hello",
-            session_id="s1",
-            metadata={"hook_event_name": "UserPromptSubmit"},
-            session_start=True,
-        )
-        assert open_event is not None
-        response = await sender.close_event(open_event, output="world")
-        self.assertEqual(response.event_id, open_event.event_id)
+    def test_complete_turn(self):
+        wf, _ = self._wf()
+        run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "go",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        run(wf.handle_pre_tool_use(
+            {"session_id": "s1", "tool_name": "Read",
+             "hook_event_name": "PreToolUse"},
+            tool_use_id="t1",
+        ))
+        run(wf.complete_user_turn("s1", "done"))
+        self.assertNotIn("s1", wf.user_events)
+        self.assertNotIn("t1", wf.tool_events)
 
-    async def test_wait_gap_is_honored(self) -> None:
-        sender = AicebergSender(dry_run=True, debug=False, min_event_gap_seconds=0.05)
-        await sender.create_event(
-            label="first",
-            event_type="user_agt",
-            content="one",
-            session_id="s1",
-            metadata={"hook_event_name": "UserPromptSubmit"},
-        )
-        start = time.monotonic()
-        await sender.create_event(
-            label="second",
-            event_type="user_agt",
-            content="two",
-            session_id="s1",
-            metadata={"hook_event_name": "UserPromptSubmit"},
-        )
-        elapsed = time.monotonic() - start
-        self.assertGreaterEqual(elapsed, 0.04)
+    def test_fail_session(self):
+        wf, _ = self._wf()
+        run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "go",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        run(wf.fail_session("s1", "timeout"))
+        self.assertNotIn("s1", wf.user_events)
 
-    async def test_missing_config_is_harmless_in_dry_run(self) -> None:
-        sender = AicebergSender(
-            api_url="",
-            api_key="",
-            use_case_id="",
-            dry_run=True,
-            debug=False,
-            min_event_gap_seconds=0,
-        )
-        response, open_event = await sender.create_event(
-            label="user prompt",
-            event_type="user_agt",
-            content="hello",
-            session_id="s1",
-            metadata={"hook_event_name": "UserPromptSubmit"},
-        )
-        self.assertTrue(response.ok)
-        self.assertIsNotNone(open_event)
+    def test_noop(self):
+        wf, _ = self._wf()
+        resp = run(wf.handle_noop({
+            "hook_event_name": "SessionStart", "session_id": "s1",
+        }))
+        self.assertIn("skipped", resp.message)
 
-
-class WorkflowTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        self.sender = FakeSender()
-        self.workflow = ClaudeAicebergWorkflow(sender=self.sender)
-
-    async def test_blocked_prompt_does_not_leave_open_event(self) -> None:
-        self.sender.create_responses = [
-            AicebergResponse(ok=True, event_result="rejected", event_id="evt-user", message="blocked")
-        ]
-        response = await self.workflow.handle_user_prompt_submit(
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": "s1",
-                "prompt": "bad prompt",
-            }
-        )
-        self.assertTrue(response.blocked)
-        self.assertEqual(self.workflow.user_events, {})
-        self.assertEqual(len(self.workflow.blocked_events), 1)
-        self.assertEqual(len(self.sender.closed), 0)
-
-        await self.workflow.flush_blocked_events("s1")
-
-        self.assertEqual(self.workflow.blocked_events, [])
-        self.assertEqual(len(self.sender.closed), 1)
-        self.assertEqual(
-            self.sender.closed[0]["output"],
-            "This request was blocked by Aiceberg safety policy.",
-        )
-
-    async def test_passed_prompt_stores_one_user_event(self) -> None:
-        await self.workflow.handle_user_prompt_submit(
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": "s1",
-                "prompt": "hello",
-            }
-        )
-        self.assertIn("s1", self.workflow.user_events)
-
-    async def test_pre_and_post_tool_use_close_matching_event(self) -> None:
-        input_data = {
-            "hook_event_name": "PreToolUse",
+    def test_stop_closes_user_event(self):
+        wf, sender = self._wf()
+        run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "what is 2+2?",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        self.assertIn("s1", wf.user_events)
+        resp = run(wf.handle_stop({
             "session_id": "s1",
-            "tool_name": "Read",
-            "tool_input": {"file_path": "README.md"},
-            "tool_use_id": "tool-1",
-        }
-        await self.workflow.handle_pre_tool_use(input_data, None)
-        self.assertIn("tool-1", self.workflow.tool_events)
+            "last_assistant_message": "4",
+            "hook_event_name": "Stop",
+        }))
+        self.assertTrue(resp.ok)
+        self.assertNotIn("s1", wf.user_events)
+        # Verify close was called with the real assistant text.
+        self.assertTrue(len(sender.closed) >= 1)
+        self.assertEqual(sender.closed[-1]["output"], "4")
 
-        await self.workflow.handle_post_tool_use(
-            {
-                "hook_event_name": "PostToolUse",
-                "session_id": "s1",
-                "tool_name": "Read",
-                "tool_input": {"file_path": "README.md"},
-                "tool_response": "content",
-                "tool_use_id": "tool-1",
-            },
-            None,
-        )
-        self.assertNotIn("tool-1", self.workflow.tool_events)
-        self.assertEqual(len(self.sender.closed), 1)
+    def test_stop_without_text_skips(self):
+        wf, _ = self._wf()
+        run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "go",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        resp = run(wf.handle_stop({
+            "session_id": "s1", "hook_event_name": "Stop",
+        }))
+        self.assertIn("no_text", resp.message)
+        # User event should still be open (runner will close via complete_user_turn).
+        self.assertIn("s1", wf.user_events)
 
-    async def test_post_tool_use_failure_closes_matching_event(self) -> None:
-        await self.workflow.handle_pre_tool_use(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": "s1",
-                "tool_name": "Bash",
-                "tool_input": {"command": "false"},
-                "tool_use_id": "tool-2",
-            },
-            None,
-        )
-        await self.workflow.handle_post_tool_use_failure(
-            {
-                "hook_event_name": "PostToolUseFailure",
-                "session_id": "s1",
-                "tool_name": "Bash",
-                "tool_input": {"command": "false"},
-                "tool_use_id": "tool-2",
-                "error": "boom",
-            },
-            None,
-        )
-        self.assertNotIn("tool-2", self.workflow.tool_events)
-        self.assertEqual(self.sender.closed[0]["output"]["hook_phase"], "post_tool_use_failure")
+    def test_stop_failure_closes_user_event(self):
+        wf, sender = self._wf()
+        run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "go",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        resp = run(wf.handle_stop_failure({
+            "session_id": "s1",
+            "error": "rate_limit",
+            "error_details": "429 Too Many Requests",
+            "hook_event_name": "StopFailure",
+        }))
+        self.assertTrue(resp.ok)
+        self.assertNotIn("s1", wf.user_events)
+        self.assertTrue(len(sender.closed) >= 1)
+        self.assertIn("rate_limit", sender.closed[-1]["output"])
 
-    async def test_blocked_tool_is_closed_immediately(self) -> None:
-        self.sender.create_responses = [
-            AicebergResponse(ok=True, event_result="rejected", event_id="evt-tool", message="blocked")
-        ]
-        response = await self.workflow.handle_pre_tool_use(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": "s1",
-                "tool_name": "WebSearch",
-                "tool_input": {"query": "top fiercest raptors birds of prey"},
-                "tool_use_id": "tool-blocked",
-            },
-            None,
-        )
-        self.assertTrue(response.blocked)
-        self.assertNotIn("tool-blocked", self.workflow.tool_events)
-        self.assertEqual(len(self.workflow.blocked_events), 1)
-        self.assertEqual(len(self.sender.closed), 0)
-
-        await self.workflow.flush_blocked_events("s1")
-
-        self.assertEqual(self.workflow.blocked_events, [])
-        self.assertEqual(len(self.sender.closed), 1)
-        self.assertEqual(
-            self.sender.closed[0]["output"],
-            "This request was blocked by Aiceberg safety policy.",
-        )
-
-    async def test_fail_session_closes_pending_prompt_and_tool_events(self) -> None:
-        await self.workflow.handle_user_prompt_submit(
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": "s1",
-                "prompt": "hello",
-            }
-        )
-        await self.workflow.handle_pre_tool_use(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": "s1",
-                "tool_name": "Read",
-                "tool_input": {"file_path": "README.md"},
-                "tool_use_id": "tool-3",
-            },
-            None,
-        )
-        await self.workflow.fail_session("s1", "runtime failure")
-        self.assertEqual(len(self.sender.closed), 2)
-
-    async def test_complete_user_turn_closes_orphan_tool_events(self) -> None:
-        await self.workflow.handle_user_prompt_submit(
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": "s1",
-                "prompt": "hello",
-            }
-        )
-        await self.workflow.handle_pre_tool_use(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": "s1",
-                "tool_name": "WebSearch",
-                "tool_input": {"query": "houston weather forecast this weekend"},
-                "tool_use_id": "tool-4",
-            },
-            None,
-        )
-
-        await self.workflow.complete_user_turn("s1", "I do not have permission to use WebSearch.")
-
-        self.assertNotIn("tool-4", self.workflow.tool_events)
-        self.assertEqual(len(self.sender.closed), 2)
-        self.assertEqual(self.sender.closed[0]["output"]["hook_phase"], "session_close")
-
-    async def test_failed_close_leaves_event_visible_in_state(self) -> None:
-        await self.workflow.handle_user_prompt_submit(
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": "s1",
-                "prompt": "hello",
-            }
-        )
-        self.sender.close_responses = [
-            AicebergResponse(ok=False, event_result="passed", event_id="evt-1", message="backend failed")
-        ]
-        await self.workflow.complete_user_turn("s1", "answer")
-        self.assertIn("s1", self.workflow.user_events)
-
-    async def test_stop_hook_is_skipped_for_live_aiceberg_traffic(self) -> None:
-        response = await self.workflow.handle_stop(
-            {
-                "hook_event_name": "Stop",
-                "session_id": "s1",
-                "stop_hook_active": False,
-            }
-        )
-        self.assertTrue(response.ok)
-        self.assertEqual(response.message, "skipped_non_live_hook:Stop")
-        self.assertEqual(self.sender.created, [])
-
-    async def test_permission_request_is_skipped_for_live_aiceberg_traffic(self) -> None:
-        response = await self.workflow.handle_permission_request(
-            {
-                "hook_event_name": "PermissionRequest",
-                "session_id": "s1",
-                "tool_name": "Bash",
-                "tool_input": {"command": "ls"},
-            }
-        )
-        self.assertTrue(response.ok)
-        self.assertEqual(response.message, "skipped_non_live_hook:PermissionRequest")
-        self.assertEqual(self.sender.created, [])
-
-    async def test_session_start_and_end_are_observation_only(self) -> None:
-        start_response = await self.workflow.handle_session_start(
-            {
-                "hook_event_name": "SessionStart",
-                "session_id": "s1",
-            }
-        )
-        end_response = await self.workflow.handle_session_end(
-            {
-                "hook_event_name": "SessionEnd",
-                "session_id": "s1",
-            }
-        )
-        self.assertEqual(start_response.message, "skipped_non_live_hook:SessionStart")
-        self.assertEqual(end_response.message, "skipped_non_live_hook:SessionEnd")
-        self.assertEqual(self.sender.created, [])
+    def test_stop_failure_with_last_message(self):
+        wf, sender = self._wf()
+        run(wf.handle_user_prompt_submit({
+            "session_id": "s1", "prompt": "go",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        resp = run(wf.handle_stop_failure({
+            "session_id": "s1",
+            "error": "rate_limit",
+            "last_assistant_message": "I was interrupted",
+            "hook_event_name": "StopFailure",
+        }))
+        self.assertTrue(resp.ok)
+        self.assertNotIn("s1", wf.user_events)
+        # When last_assistant_message is present, use it as output.
+        self.assertIn("I was interrupted", sender.closed[-1]["output"])
 
 
-class ToolClassificationTests(unittest.TestCase):
-    def test_agent_and_task_are_classified_as_agent_events(self) -> None:
-        self.assertEqual(classify_tool_event("Agent"), AGENT_EVENT_TYPE)
-        self.assertEqual(classify_tool_event("Task"), AGENT_EVENT_TYPE)
+# ── Subagents ────────────────────────────────────────────────────────────────
 
-    def test_other_tools_are_classified_as_regular_tool_events(self) -> None:
-        self.assertEqual(classify_tool_event("WebSearch"), TOOL_EVENT_TYPE)
-        self.assertEqual(classify_tool_event("mcp__memory__create_entities"), TOOL_EVENT_TYPE)
+class SubagentTests(unittest.TestCase):
+
+    def _wf(self):
+        return ClaudeAicebergWorkflow(FakeSender())
+
+    def test_register(self):
+        wf = self._wf()
+        resp = run(wf.handle_subagent_start({
+            "session_id": "s1", "agent_id": "a1", "agent_type": "inner",
+        }))
+        self.assertIn("registered", resp.message)
+        self.assertEqual(len(wf.list_subagents()), 1)
+
+    def test_stop(self):
+        wf = self._wf()
+        run(wf.handle_subagent_start({
+            "session_id": "s1", "agent_id": "a1", "agent_type": "inner",
+        }))
+        run(wf.handle_subagent_stop({
+            "session_id": "s1", "agent_id": "a1",
+            "agent_transcript_path": "/tmp/t.json",
+        }))
+        rec = wf.subagents["a1"]
+        self.assertIsNotNone(rec.stopped_at)
+        self.assertEqual(rec.transcript_path, "/tmp/t.json")
+
+    def test_missing_id_skips(self):
+        wf = self._wf()
+        resp = run(wf.handle_subagent_start({"session_id": "s1"}))
+        self.assertIn("skipped", resp.message)
+
+    def test_tool_in_subagent_metadata(self):
+        wf = self._wf()
+        run(wf.handle_subagent_start({
+            "session_id": "s1", "agent_id": "a1", "agent_type": "inner",
+        }))
+        run(wf.handle_pre_tool_use(
+            {"session_id": "s1", "tool_name": "Read",
+             "agent_id": "a1", "agent_type": "inner",
+             "hook_event_name": "PreToolUse"},
+            tool_use_id="t1",
+        ))
+        event = wf.tool_events["t1"]
+        self.assertEqual(event.metadata.get("agent_id"), "a1")
 
 
-class RegistryTests(unittest.TestCase):
-    def test_registry_contains_all_supported_hooks(self) -> None:
-        workflow = ClaudeAicebergWorkflow(sender=FakeSender())
-        callbacks = ClaudeHookCallbacks(workflow)
-        registry = build_hook_registry(callbacks)
+# ── Classification ───────────────────────────────────────────────────────────
 
-        self.assertEqual(list(registry.keys()), list(SUPPORTED_HOOK_EVENTS))
-        for matchers in registry.values():
-            self.assertEqual(len(matchers), 1)
-            self.assertEqual(len(matchers[0].hooks), 1)
+class ClassificationTests(unittest.TestCase):
+
+    def test_agent_tool(self):
+        self.assertEqual(classify_tool_event("Agent"), "agt_agt")
+        self.assertEqual(classify_tool_event("Task"), "agt_agt")
+
+    def test_regular_tool(self):
+        self.assertEqual(classify_tool_event("Read"), "agt_tool")
+
+
+# ── Hooks / Registry ────────────────────────────────────────────────────────
+
+class HooksTests(unittest.TestCase):
+
+    def test_event_count(self):
+        self.assertEqual(len(SUPPORTED_HOOK_EVENTS), 13)
+
+    def test_block_output_tool(self):
+        out = build_block_output("PreToolUse", "nope")
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("hookSpecificOutput", out)
+
+    def test_block_output_prompt(self):
+        out = build_block_output("UserPromptSubmit", "nope")
+        self.assertNotIn("hookSpecificOutput", out)
+
+    def test_registry_builds(self):
+        wf = ClaudeAicebergWorkflow(FakeSender())
+        registry = build_hook_registry(wf)
+        self.assertEqual(len(registry), len(SUPPORTED_HOOK_EVENTS))
+
+    def test_dispatch_prompt(self):
+        wf = ClaudeAicebergWorkflow(FakeSender())
+        resp = run(dispatch_hook(wf, "UserPromptSubmit", {
+            "session_id": "s1", "prompt": "hi",
+            "hook_event_name": "UserPromptSubmit",
+        }))
+        self.assertTrue(resp.ok)
+
+    def test_dispatch_noop(self):
+        wf = ClaudeAicebergWorkflow(FakeSender())
+        resp = run(dispatch_hook(wf, "SessionStart", {
+            "session_id": "s1", "hook_event_name": "SessionStart",
+        }))
+        self.assertIn("skipped", resp.message)
 
 
 if __name__ == "__main__":

@@ -22,11 +22,12 @@ from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from .config import workspace_paths
+
 
 DEFAULT_API_URL = "https://api.test1.aiceberg.ai/eap/v1/event"
 DEFAULT_TIMEOUT_SECONDS = 10
 DEFAULT_MIN_EVENT_GAP_SECONDS = 25.0
-ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
 def load_env_file(path: str | Path, *, overwrite: bool = True) -> None:
@@ -56,9 +57,6 @@ def serialize_content(content: str | dict[str, Any] | list[Any]) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=True, sort_keys=True)
-
-
-load_env_file(ENV_PATH, overwrite=True)
 
 
 @dataclass(frozen=True)
@@ -96,20 +94,23 @@ class AicebergSender:
         use_case_id: str | None = None,
         fail_open: bool | None = None,
         timeout_seconds: int | None = None,
-        min_event_gap_seconds: float = DEFAULT_MIN_EVENT_GAP_SECONDS,
+        min_event_gap_seconds: float | None = None,
         debug: bool | None = None,
         retry_update_with_input: bool | None = None,
         dry_run: bool | None = None,
     ) -> None:
-        self.api_url = api_url or os.getenv("AICEBERG_API_URL", DEFAULT_API_URL)
-        self.api_key = api_key or os.getenv("AICEBERG_API_KEY", "")
-        self.use_case_id = use_case_id or os.getenv("USE_CASE_ID", "")
+        load_env_file(workspace_paths().env_path, overwrite=True)
+        self.api_url = api_url if api_url is not None else os.getenv("AICEBERG_API_URL", DEFAULT_API_URL)
+        self.api_key = api_key if api_key is not None else os.getenv("AICEBERG_API_KEY", "")
+        self.use_case_id = use_case_id if use_case_id is not None else os.getenv("USE_CASE_ID", "")
         self.fail_open = fail_open if fail_open is not None else env_flag("AICEBERG_FAIL_OPEN", True)
         self.timeout_seconds = int(
             timeout_seconds if timeout_seconds is not None else os.getenv("AICEBERG_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))
         )
         self.min_event_gap_seconds = float(
-            os.getenv("AICEBERG_MIN_EVENT_GAP_SECONDS", str(min_event_gap_seconds))
+            min_event_gap_seconds
+            if min_event_gap_seconds is not None
+            else os.getenv("AICEBERG_MIN_EVENT_GAP_SECONDS", str(DEFAULT_MIN_EVENT_GAP_SECONDS))
         )
         self.debug = debug if debug is not None else env_flag("AICEBERG_DEBUG", True)
         self.retry_update_with_input = (

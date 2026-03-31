@@ -1,0 +1,3 @@
+[console_scripts]
+claude-aiceberg-hook = claude_code_aiceberg_hook:cli_main
+claude-aiceberg-init = claude_aiceberg.cli:init_main

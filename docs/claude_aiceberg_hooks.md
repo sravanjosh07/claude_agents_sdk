@@ -40,6 +40,8 @@ we need for v1:
 - `PreToolUse`
 - `PostToolUse`
 - `Stop`
+- `SubagentStart`
+- `SubagentStop`
 
 ## Current hook scope
 
@@ -61,6 +63,7 @@ The first version keeps the behavior intentionally simple:
 
 - prompt and tool hooks are the only paired input/output events
 - only prompt and tool-use hooks send live Aiceberg traffic right now
+- subagent hooks track agent identity and attribute tool events to the right subagent
 - lifecycle hooks and permission requests are registered but skipped locally for now
 - prompt and pre-tool hooks are the block-capable ones
 
@@ -112,6 +115,7 @@ Owns:
 
 - open event tracking
 - prompt/tool close handling
+- subagent registry (start, stop, lookup by agent_id)
 - fallback close attempts on Claude failure
 - local skipping for non-live hooks
 - unresolved-event reporting
@@ -119,6 +123,7 @@ Owns:
 Important choice:
 
 - prompt and tool hooks are paired
+- subagent hooks track identity but do not send separate Aiceberg events yet
 - non-live hooks are still registered, but they do not send Aiceberg events in v1
 
 ### 4. `hooks.py`
@@ -142,6 +147,14 @@ Owns:
 - building `ClaudeAgentOptions`
 - printing Claude output
 
+### 6. `run_subagent_example.py`
+
+Owns:
+
+- named `AgentDefinition` entries for delegation
+- a prompt that asks Claude to use those subagents
+- subagent summary reporting after the run
+
 ## Run
 
 ```bash
@@ -149,8 +162,16 @@ source /Users/sravanjosh/Documents/Aiceberg/cluade_sdk/.venv/bin/activate
 python3 /Users/sravanjosh/Documents/Aiceberg/cluade_sdk/src/run_claude_aiceberg_hooks.py
 ```
 
+To try the subagent example:
+
+```bash
+python3 /Users/sravanjosh/Documents/Aiceberg/cluade_sdk/src/run_subagent_example.py
+```
+
 To try a different example, edit the `PROMPT` constant in
-[run_claude_aiceberg_hooks.py](/Users/sravanjosh/Documents/Aiceberg/cluade_sdk/src/run_claude_aiceberg_hooks.py).
+[run_claude_aiceberg_hooks.py](/Users/sravanjosh/Documents/Aiceberg/cluade_sdk/src/run_claude_aiceberg_hooks.py)
+or the `AGENTS` / `PROMPT` in
+[run_subagent_example.py](/Users/sravanjosh/Documents/Aiceberg/cluade_sdk/src/run_subagent_example.py).
 
 ## Auth and model behavior
 

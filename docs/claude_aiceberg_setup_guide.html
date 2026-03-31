@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Claude + Aiceberg Setup Guide</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 820px; margin: 40px auto; padding: 0 20px; color: #333; line-height: 1.6; }
+    h1 { border-bottom: 2px solid #2563eb; padding-bottom: 8px; }
+    h2 { color: #2563eb; margin-top: 36px; }
+    h3 { color: #1e40af; }
+    code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 0.95em; }
+    pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 0.9em; }
+    pre code { background: none; padding: 0; color: inherit; }
+    table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+    th, td { border: 1px solid #cbd5e1; padding: 8px 12px; text-align: left; }
+    th { background: #f1f5f9; }
+    .note { background: #eff6ff; border-left: 4px solid #2563eb; padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0; }
+    .warn { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0; }
+    .step { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+    .step-num { display: inline-block; background: #2563eb; color: #fff; width: 28px; height: 28px; border-radius: 50%; text-align: center; line-height: 28px; font-weight: bold; margin-right: 8px; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-weight: 600; }
+    .tag-sdk { background: #dbeafe; color: #1e40af; }
+    .tag-cli { background: #dcfce7; color: #166534; }
+  </style>
+</head>
+<body>
+
+<h1>Claude + Aiceberg Setup Guide</h1>
+
+<p>
+  This guide explains how to add <strong>Aiceberg observability and control</strong> to your Claude agents.
+  It works for both the <span class="tag tag-sdk">Python SDK</span> and the <span class="tag tag-cli">Claude Code CLI</span>.
+</p>
+
+<h2>What Does This Do?</h2>
+
+<p>Once installed, every interaction with Claude is tracked on the Aiceberg dashboard:</p>
+
+<table>
+  <tr><th>What gets tracked</th><th>How</th></tr>
+  <tr><td>User prompts</td><td>Opens a <code>user_agt</code> event, closes it with the assistant's response</td></tr>
+  <tr><td>Tool calls (Read, Bash, WebSearch, …)</td><td>Opens an <code>agt_tool</code> event on PreToolUse, closes it on PostToolUse</td></tr>
+  <tr><td>Subagent delegation (Agent/Task tools)</td><td>Opens an <code>agt_agt</code> event, same open/close pattern</td></tr>
+  <tr><td>Blocked actions</td><td>If Aiceberg policy blocks a prompt or tool, the agent stops and the event is closed cleanly</td></tr>
+  <tr><td>Errors</td><td>API failures (StopFailure) close all open events so nothing is left orphaned</td></tr>
+</table>
+
+<h2>Prerequisites</h2>
+
+<ul>
+  <li>Python 3.11+</li>
+  <li>An Aiceberg account with an <strong>API key</strong> and a <strong>Use Case ID</strong></li>
+  <li>For CLI path: Claude Code installed (<code>claude</code> command available)</li>
+</ul>
+
+<!-- ──────────────────────────────────────────────── -->
+<h2>Setup (Both Paths)</h2>
+
+<div class="step">
+  <p><span class="step-num">1</span> <strong>Clone &amp; install the package</strong></p>
+<pre><code>git clone https://github.com/sravanjosh07/claude_agents_sdk.git
+cd claude_agents_sdk
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .</code></pre>
+</div>
+
+<div class="step">
+  <p><span class="step-num">2</span> <strong>Create a <code>.env</code> file</strong> in your project root</p>
+<pre><code># Required
+AICEBERG_API_KEY=your-api-key-here
+USE_CASE_ID=your-use-case-id-here
+
+# Optional
+AICEBERG_DRY_RUN=false
+AICEBERG_USER_ID=your-name</code></pre>
+</div>
+
+<div class="note">
+  You can find the API key and Use Case ID in your Aiceberg account settings.
+</div>
+
+<!-- ──────────────────────────────────────────────── -->
+<h2><span class="tag tag-cli">Path A</span> — Claude Code CLI (Terminal)</h2>
+
+<p>This is for people who use <code>claude</code> in the terminal. You type prompts, Claude uses tools, and Aiceberg watches everything.</p>
+
+<div class="step">
+  <p><span class="step-num">3</span> <strong>Generate the hook settings</strong></p>
+<pre><code>cd /path/to/your-project
+claude-aiceberg-init --workspace . --allow-web-search --debug</code></pre>
+  <p>This writes <code>.claude/settings.local.json</code> with all the hook entries. You only need to do this once per project.</p>
+</div>
+
+<div class="step">
+  <p><span class="step-num">4</span> <strong>Use Claude as normal</strong></p>
+<pre><code>claude</code></pre>
+  <p>That's it. Every prompt and tool call now shows up on the Aiceberg dashboard automatically.</p>
+</div>
+
+<h3>How it works under the hood</h3>
+<ol>
+  <li>Claude Code fires hook events (UserPromptSubmit, PreToolUse, Stop, etc.)</li>
+  <li>Each event spawns <code>claude-aiceberg-hook</code> as a subprocess</li>
+  <li>The hook sends the event to Aiceberg and returns a decision (allow / block)</li>
+  <li>State is persisted in SQLite at <code>.claude/aiceberg_state.sqlite3</code></li>
+</ol>
+
+<!-- ──────────────────────────────────────────────── -->
+<h2><span class="tag tag-sdk">Path B</span> — Python SDK (Code)</h2>
+
+<p>This is for people writing Python agents using the Claude Agent SDK.</p>
+
+<div class="step">
+  <p><span class="step-num">3</span> <strong>Add three lines to your code</strong></p>
+<pre><code>from claude_agent_sdk import query
+from claude_aiceberg import ClaudeAicebergHooks
+
+hooks = ClaudeAicebergHooks()
+options = hooks.agent_options(prompt="What is the weather in Houston?")
+
+async for msg in query(options=options):
+    # your existing message handling
+    ...</code></pre>
+</div>
+
+<div class="step">
+  <p><span class="step-num">4</span> <strong>Close the turn when done</strong></p>
+<pre><code># After the loop finishes:
+await hooks.complete_user_turn(session_id, final_text)
+
+# If something goes wrong:
+await hooks.fail_session(session_id, str(exc))</code></pre>
+</div>
+
+<h3>With subagents</h3>
+<pre><code>from claude_agent_sdk import AgentDefinition
+from claude_aiceberg import ClaudeAicebergHooks
+
+agents = {
+    "file-counter": AgentDefinition(
+        name="file-counter",
+        description="Counts files matching a pattern.",
+        instructions="Use Glob + Bash to count files.",
+        allowed_tools=["Glob", "Bash"],
+    ),
+}
+
+hooks = ClaudeAicebergHooks(agents=agents)
+options = hooks.agent_options(prompt="Count all Python files in this repo.")</code></pre>
+
+<p>A ready-to-run example is at <code>examples/run_hooks.py</code>.</p>
+
+<!-- ──────────────────────────────────────────────── -->
+<h2>What Gets Sent to Aiceberg</h2>
+
+<table>
+  <tr><th>Hook Event</th><th>Event Type</th><th>Blockable?</th><th>Notes</th></tr>
+  <tr><td>UserPromptSubmit</td><td><code>user_agt</code></td><td>✅ Yes</td><td>Opens when user sends a prompt</td></tr>
+  <tr><td>PreToolUse</td><td><code>agt_tool</code> / <code>agt_agt</code></td><td>✅ Yes</td><td>Opens when Claude wants to use a tool</td></tr>
+  <tr><td>PostToolUse</td><td>—</td><td>No</td><td>Closes the tool event with the result</td></tr>
+  <tr><td>PostToolUseFailure</td><td>—</td><td>No</td><td>Closes the tool event with an error</td></tr>
+  <tr><td>Stop</td><td>—</td><td>No</td><td>Closes the user event with assistant response</td></tr>
+  <tr><td>StopFailure</td><td>—</td><td>No</td><td>Closes everything on API errors</td></tr>
+  <tr><td>SubagentStart</td><td>—</td><td>No</td><td>Registers subagent identity locally</td></tr>
+  <tr><td>SubagentStop</td><td>—</td><td>No</td><td>Records stop time and transcript path</td></tr>
+</table>
+
+<div class="note">
+  <strong>Blocking:</strong> If Aiceberg policy says "block", the agent stops immediately.
+  The prompt or tool call never reaches Claude. The event is closed on the dashboard with a block message.
+</div>
+
+<!-- ──────────────────────────────────────────────── -->
+<h2>Troubleshooting</h2>
+
+<table>
+  <tr><th>Problem</th><th>Fix</th></tr>
+  <tr><td>Events not showing up</td><td>Check <code>AICEBERG_DRY_RUN</code> is <code>false</code> and API key is set in <code>.env</code></td></tr>
+  <tr><td><code>claude-aiceberg-hook: command not found</code></td><td>Run <code>pip install -e .</code> again — the console scripts need an editable install</td></tr>
+  <tr><td>Events stay "open" on dashboard</td><td>Make sure you call <code>complete_user_turn()</code> (SDK) or that Stop hook is firing (CLI)</td></tr>
+  <tr><td>Need debug logs</td><td>Set <code>AICEBERG_HOOK_DEBUG=1</code> in <code>.env</code> — logs go to <code>.claude/aiceberg_hook_debug.jsonl</code></td></tr>
+  <tr><td>Settings file looks wrong</td><td>Delete <code>.claude/settings.local.json</code> and re-run <code>claude-aiceberg-init --workspace . --debug</code></td></tr>
+</table>
+
+<!-- ──────────────────────────────────────────────── -->
+<h2>File Map</h2>
+
+<table>
+  <tr><th>File</th><th>What it does</th></tr>
+  <tr><td><code>src/claude_aiceberg/__init__.py</code></td><td>Public API — <code>ClaudeAicebergHooks</code></td></tr>
+  <tr><td><code>src/claude_aiceberg/workflow.py</code></td><td>Event lifecycle (SDK path) — open/close/block logic</td></tr>
+  <tr><td><code>src/claude_aiceberg/hooks.py</code></td><td>Hook dispatch table for the SDK</td></tr>
+  <tr><td><code>src/claude_aiceberg/sender.py</code></td><td>HTTP transport to Aiceberg API</td></tr>
+  <tr><td><code>src/claude_aiceberg/config.py</code></td><td>Settings builder, paths, hook config</td></tr>
+  <tr><td><code>src/claude_aiceberg/cli.py</code></td><td><code>claude-aiceberg-init</code> command</td></tr>
+  <tr><td><code>src/claude_code_aiceberg_hook.py</code></td><td>CLI hook handler (runs as subprocess)</td></tr>
+  <tr><td><code>examples/run_hooks.py</code></td><td>Example runner</td></tr>
+</table>
+
+<hr>
+<p style="color: #94a3b8; font-size: 0.85em;">Last updated: March 2026</p>
+
+</body>
+</html>

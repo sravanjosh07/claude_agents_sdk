@@ -14,11 +14,12 @@ dependencies = [
 
 [project.scripts]
 claude-aiceberg-hook = "claude_code_aiceberg_hook:cli_main"
+claude-aiceberg-server = "claude_code_aiceberg_server:server_main"
 claude-aiceberg-init = "claude_aiceberg.cli:init_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["claude_code_aiceberg_hook"]
+py-modules = ["claude_code_aiceberg_hook", "claude_code_aiceberg_server"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

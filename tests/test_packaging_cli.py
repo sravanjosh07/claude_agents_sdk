@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from claude_aiceberg.config import (
     ASYNC_HOOKS,
+    DEFAULT_HTTP_HOST,
+    DEFAULT_HTTP_PORT,
     MANAGED_CLAUDE_CODE_HOOKS,
     WorkspacePaths,
     build_managed_hook_settings,
@@ -102,6 +104,58 @@ class WorkspaceResolutionTests(unittest.TestCase):
         self.assertEqual(merged["custom_key"], "value")
         self.assertIn("MyHook", merged["hooks"])
         self.assertIn("UserPromptSubmit", merged["hooks"])
+
+
+class HttpModeTests(unittest.TestCase):
+    """Tests for HTTP hook mode configuration."""
+
+    def test_http_mode_uses_http_type(self):
+        hooks = build_managed_hook_settings("/tmp/test", mode="http")
+        for name in MANAGED_CLAUDE_CODE_HOOKS:
+            entries = hooks[name]
+            for group in entries:
+                for h in group["hooks"]:
+                    self.assertEqual(h["type"], "http", f"{name} should use http type")
+                    self.assertIn("url", h, f"{name} should have url")
+                    self.assertNotIn("command", h, f"{name} should not have command")
+
+    def test_http_urls_contain_hook_name(self):
+        hooks = build_managed_hook_settings("/tmp/test", mode="http")
+        for name in MANAGED_CLAUDE_CODE_HOOKS:
+            url = hooks[name][0]["hooks"][0]["url"]
+            self.assertIn(f"/{name}", url, f"URL should contain /{name}")
+
+    def test_http_mode_uses_configured_port(self):
+        hooks = build_managed_hook_settings("/tmp/test", mode="http", http_port=9999)
+        url = hooks["PreToolUse"][0]["hooks"][0]["url"]
+        self.assertIn(":9999/", url)
+
+    def test_http_mode_no_async_flag(self):
+        """HTTP hooks don't need async flag — Claude handles it natively."""
+        hooks = build_managed_hook_settings("/tmp/test", mode="http")
+        for name in MANAGED_CLAUDE_CODE_HOOKS:
+            for group in hooks[name]:
+                for h in group["hooks"]:
+                    self.assertNotIn("async", h, f"{name} http hook should not have async")
+
+    def test_command_mode_still_default(self):
+        hooks = build_managed_hook_settings("/tmp/test")
+        h = hooks["PreToolUse"][0]["hooks"][0]
+        self.assertEqual(h["type"], "command")
+
+    def test_cli_parser_http_mode(self):
+        parser = build_init_parser()
+        args = parser.parse_args(["--mode", "http", "--http-port", "9999"])
+        self.assertEqual(args.mode, "http")
+        self.assertEqual(args.http_port, 9999)
+
+    def test_write_settings_http_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = write_settings_file(workspace=tmpdir, mode="http")
+            data = json.loads(paths.settings_path.read_text())
+            h = data["hooks"]["PreToolUse"][0]["hooks"][0]
+            self.assertEqual(h["type"], "http")
+            self.assertIn("url", h)
 
 
 if __name__ == "__main__":

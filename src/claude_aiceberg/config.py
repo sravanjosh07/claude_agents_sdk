@@ -63,6 +63,10 @@ def workspace_paths(workspace: str | Path | None = None) -> WorkspacePaths:
     )
 
 
+DEFAULT_HTTP_PORT = 8932
+DEFAULT_HTTP_HOST = "127.0.0.1"
+
+
 def build_hook_command(workspace: str | Path | None = None, *, debug: bool = False) -> str:
     resolved = resolve_workspace_root(workspace)
     parts = [DEFAULT_HOOK_COMMAND, "--workspace", str(resolved)]
@@ -71,16 +75,29 @@ def build_hook_command(workspace: str | Path | None = None, *, debug: bool = Fal
     return " ".join(shlex.quote(part) for part in parts)
 
 
-def build_managed_hook_settings(workspace: str | Path | None = None, *, debug: bool = False) -> dict[str, list[dict[str, Any]]]:
-    command = build_hook_command(workspace, debug=debug)
+def build_managed_hook_settings(
+    workspace: str | Path | None = None,
+    *,
+    debug: bool = False,
+    mode: str = "command",
+    http_host: str = DEFAULT_HTTP_HOST,
+    http_port: int = DEFAULT_HTTP_PORT,
+) -> dict[str, list[dict[str, Any]]]:
     hooks: dict[str, list[dict[str, Any]]] = {}
     for hook_name in MANAGED_CLAUDE_CODE_HOOKS:
-        hook_entry: dict[str, Any] = {
-            "type": "command",
-            "command": command,
-        }
-        if hook_name in ASYNC_HOOKS:
-            hook_entry["async"] = True
+        if mode == "http":
+            hook_entry: dict[str, Any] = {
+                "type": "http",
+                "url": f"http://{http_host}:{http_port}/{hook_name}",
+            }
+        else:
+            command = build_hook_command(workspace, debug=debug)
+            hook_entry = {
+                "type": "command",
+                "command": command,
+            }
+            if hook_name in ASYNC_HOOKS:
+                hook_entry["async"] = True
         matcher_entry: dict[str, Any] = {
             "hooks": [hook_entry]
         }
@@ -96,11 +113,17 @@ def merge_settings(
     workspace: str | Path | None = None,
     allow_web_search: bool = False,
     debug: bool = False,
+    mode: str = "command",
+    http_host: str = DEFAULT_HTTP_HOST,
+    http_port: int = DEFAULT_HTTP_PORT,
 ) -> dict[str, Any]:
     merged = dict(existing or {})
     existing_hooks = merged.get("hooks")
     hooks = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
-    hooks.update(build_managed_hook_settings(workspace, debug=debug))
+    hooks.update(build_managed_hook_settings(
+        workspace, debug=debug, mode=mode,
+        http_host=http_host, http_port=http_port,
+    ))
     merged["hooks"] = hooks
 
     if allow_web_search:
@@ -133,6 +156,9 @@ def write_settings_file(
     workspace: str | Path | None = None,
     allow_web_search: bool = False,
     debug: bool = False,
+    mode: str = "command",
+    http_host: str = DEFAULT_HTTP_HOST,
+    http_port: int = DEFAULT_HTTP_PORT,
 ) -> WorkspacePaths:
     paths = workspace_paths(workspace)
     paths.claude_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +167,9 @@ def write_settings_file(
         workspace=paths.workspace_root,
         allow_web_search=allow_web_search,
         debug=debug,
+        mode=mode,
+        http_host=http_host,
+        http_port=http_port,
     )
     paths.settings_path.write_text(json.dumps(merged, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return paths
